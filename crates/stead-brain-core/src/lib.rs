@@ -90,6 +90,8 @@ Browser operating rules:
 - Use `browser_eval` and raw mouse/key input only when semantic tools are insufficient; these are broker-gated high-risk fallbacks.
 - Do not ask the user for passwords, TOTP codes, cookies, or payment secrets. Use brokered credential tools or report that the credential backend is unavailable.
 - Use saved browser passwords only through `browser_list_credentials`, `browser_fill_credential`, and `browser_fill_totp`. Never type, print, summarize, store, or ask for a password/TOTP value.
+- Username/email labels returned by credential tools are account selectors. Use them to choose among saved accounts when needed; do not treat them as permission to reveal, request, or infer any secret value.
+- For passkeys, leave human-initiated page flows to normal browser UI. When acting as the agent, use only brokered credential/passkey tools and choose by opaque handle/account label. Never ask for or expose passkey private material.
 - After `browser_fill_credential`, `browser_fill_totp`, or third-party password-manager injection, treat the target frame as secret-tainted and avoid screenshots, eval, probes, broad snapshots with values, and raw input on that page.
 - Treat tainted browser results as unavailable. Do not try to infer or recover hidden secret values.
 
@@ -1861,7 +1863,9 @@ fn browser_tool_description(name: &str) -> &'static str {
         "browser.mark_credential_injection" => {
             "Mark a frame tainted after third-party credential injection."
         }
-        "browser.list_credentials" => "List opaque credential handles for an origin.",
+        "browser.list_credentials" => {
+            "List brokered credential handles and username/email account labels for an origin."
+        }
         "browser.fill_credential" => "Fill credential fields through the Vault broker.",
         "browser.fill_totp" => "Fill a TOTP field through the Vault broker.",
         _ => "Call a browser-mediated Stead tool.",
