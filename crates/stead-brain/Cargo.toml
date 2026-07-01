@@ -1,0 +1,16 @@
+[package]
+name = "stead-brain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+stead-brain-core = { path = "../stead-brain-core" }
+stead-brain-protocol = { path = "../stead-brain-protocol" }
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

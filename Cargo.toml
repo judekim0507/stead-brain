@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/stead-brain",
+  "crates/stead-brain-core",
+  "crates/stead-brain-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = "0.3"
+keyring = { version = "=3.6.3", default-features = false }
+parking_lot = "0.12"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+walkdir = "2"
+
+pie-agent-core = { path = "vendor/pie/crates/agent", default-features = false, features = ["harness", "native-env"] }
+pie-ai = { path = "vendor/pie/crates/ai", default-features = false, features = ["anthropic", "openai-responses", "openai-completions", "openai-codex-responses", "google", "faux"] }
+
+[workspace.lints.clippy]
+large_enum_variant = "allow"
+module_inception = "allow"
+type_complexity = "allow"
+manual_div_ceil = "allow"
+too_many_arguments = "allow"
+new_without_default = "allow"
+await_holding_lock = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
