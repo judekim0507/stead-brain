@@ -54,6 +54,15 @@ pub enum FileAccessMode {
     FullDisk,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPermissionMode {
+    Ask,
+    #[default]
+    Read,
+    Full,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSessionParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +79,8 @@ pub struct SendMessageParams {
     pub tab_context: Option<TabContext>,
     #[serde(default)]
     pub model: Option<ModelSelection>,
+    #[serde(default)]
+    pub permission_mode: AgentPermissionMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

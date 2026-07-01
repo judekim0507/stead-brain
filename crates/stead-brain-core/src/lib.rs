@@ -18,10 +18,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use stead_brain_protocol::{
-    AssistantDone, BrainEvent, CreateSessionParams, ErrorInfo, FileAccessMode, InitializeParams,
-    ModelCatalogEntry, ModelCatalogProvider, NotificationInfo, PROTOCOL_VERSION, ReadyInfo,
-    ResponseEnvelope, SendMessageParams, SessionInfo, ToolCallEnvelope, ToolResultEnvelope,
-    ToolResultPayload, ToolStatus, UsageUpdate,
+    AgentPermissionMode, AssistantDone, BrainEvent, CreateSessionParams, ErrorInfo, FileAccessMode,
+    InitializeParams, ModelCatalogEntry, ModelCatalogProvider, NotificationInfo, PROTOCOL_VERSION,
+    ReadyInfo, ResponseEnvelope, SendMessageParams, SessionInfo, ToolCallEnvelope,
+    ToolResultEnvelope, ToolResultPayload, ToolStatus, UsageUpdate,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -54,6 +54,7 @@ const WEB_FETCH_TIMEOUT_SECS: u64 = 20;
 const MAX_NOTIFICATION_TITLE_CHARS: usize = 96;
 const MAX_NOTIFICATION_BODY_CHARS: usize = 512;
 const MAX_NOTIFICATION_CATEGORY_CHARS: usize = 64;
+const DEFAULT_TURN_MAX_OUTPUT_TOKENS: u32 = 4096;
 const BUILTIN_STEAD_SKILLS: &[(&str, &str)] = &[
     (
         "artifact-document/SKILL.md",
@@ -81,19 +82,21 @@ const STEAD_SYSTEM_PROMPT: &str = r#"You are Stead, a browser-native agent built
 Your job is to help the user by using native browser perception and action tools carefully, efficiently, and safely.
 
 Browser operating rules:
-- Prefer native accessibility snapshots first. Use `browser.snapshot` to understand the page, then act on stable node references.
-- Prefer semantic actions: `browser.click`, `browser.fill`, `browser.focus`, and `browser.scroll_into_view`.
+- Prefer native accessibility snapshots first. Use `browser_snapshot` to understand the page, then act on stable node references.
+- Prefer semantic actions: `browser_click`, `browser_fill`, `browser_focus`, and `browser_scroll_into_view`.
 - After any page-changing action, re-snapshot or otherwise verify before claiming success.
-- Use `browser.probe_node` only when the AX snapshot is ambiguous.
+- Use `browser_probe_node` only when the AX snapshot is ambiguous.
 - Use screenshots only when visual layout matters or AX/probe cannot answer the question.
-- Use `browser.eval` and raw mouse/key input only when semantic tools are insufficient; these are broker-gated high-risk fallbacks.
+- Use `browser_eval` and raw mouse/key input only when semantic tools are insufficient; these are broker-gated high-risk fallbacks.
 - Do not ask the user for passwords, TOTP codes, cookies, or payment secrets. Use brokered credential tools or report that the credential backend is unavailable.
+- Use saved browser passwords only through `browser_list_credentials`, `browser_fill_credential`, and `browser_fill_totp`. Never type, print, summarize, store, or ask for a password/TOTP value.
+- After `browser_fill_credential`, `browser_fill_totp`, or third-party password-manager injection, treat the target frame as secret-tainted and avoid screenshots, eval, probes, broad snapshots with values, and raw input on that page.
 - Treat tainted browser results as unavailable. Do not try to infer or recover hidden secret values.
 
 File rules:
 - Your working folder is the current chat session folder. Treat relative paths as relative to that folder.
 - The session folder contains `attachments/` for read-only user inputs, `tmp/` for scratch files/previews/scripts/intermediate work, and `artifacts/` for durable outputs the user asked you to create.
-- Use `files.write` for both text and binary outputs. For binary files, pass `content_base64`.
+- Use `files_write` for both text and binary outputs. For binary files, pass `content_base64`.
 - Put temporary scripts and intermediate data under `tmp/`; put final documents, PDFs, spreadsheets, generated data, and other user-facing outputs under `artifacts/`.
 - Do not write into `attachments/`.
 - By default, file tools can access only the current chat session folder. Approved folders or full-disk access are separate user-granted modes; never assume Downloads or arbitrary local paths are available.
@@ -128,6 +131,23 @@ Behavior:
 - When you need to use tools, explain progress briefly only when useful.
 - Keep tool results compact. Avoid expensive screenshots, broad file searches, and repeated full-page snapshots when a narrower read is enough.
 - If blocked by policy, missing credentials, missing browser context, or unavailable tooling, say exactly what is blocked and what would unblock it."#;
+
+fn permission_mode_prompt(mode: AgentPermissionMode) -> &'static str {
+    match mode {
+        AgentPermissionMode::Ask => {
+            "Permission mode: ask first.\n\
+Saved-password and TOTP use must go through the brokered credential tools and may require browser approval before use. If a credential tool returns needs_confirmation, wait for the browser/user approval result instead of asking the user for the secret or retrying in a loop."
+        }
+        AgentPermissionMode::Read => {
+            "Permission mode: read only.\n\
+Saved-password and TOTP use is pre-authorized through the brokered credential tools when needed for sign-in. Page reads are allowed; page-changing actions beyond credential/login flows may still be blocked or broker-gated. Never ask for or reveal the secret."
+        }
+        AgentPermissionMode::Full => {
+            "Permission mode: full access.\n\
+Saved-password and TOTP use is pre-authorized through the brokered credential tools when needed for sign-in. Broader browser/file actions may be available, but credential secrecy and post-fill taint rules still apply."
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum BrainError {
@@ -212,40 +232,135 @@ pub trait BrowserToolBridge: Send + Sync {
 }
 
 pub fn browser_tools(bridge: Arc<dyn BrowserToolBridge>) -> Vec<Arc<dyn AgentTool>> {
-    browser_tool_names()
+    browser_tool_specs()
         .into_iter()
-        .map(|name| Arc::new(BrowserMediatedTool::new(name, bridge.clone())) as Arc<dyn AgentTool>)
+        .map(|spec| Arc::new(BrowserMediatedTool::new(*spec, bridge.clone())) as Arc<dyn AgentTool>)
         .collect()
 }
 
 pub fn browser_tool_names() -> Vec<&'static str> {
-    vec![
-        "browser.list_tabs",
-        "browser.snapshot",
-        "browser.probe_node",
-        "browser.screenshot",
-        "browser.click",
-        "browser.fill",
-        "browser.focus",
-        "browser.scroll_into_view",
-        "browser.navigate",
-        "browser.open_tab",
-        "browser.close_tab",
-        "browser.eval",
-        "browser.key",
-        "browser.mouse_click",
-        "browser.mouse_move",
-        "browser.mouse_down",
-        "browser.mouse_up",
-        "browser.mouse_drag",
-        "browser.scroll",
-        "browser.handle_dialog",
-        "browser.handle_file_chooser",
-        "browser.mark_credential_injection",
-        "browser.list_credentials",
-        "browser.fill_credential",
-        "browser.fill_totp",
+    browser_tool_specs()
+        .iter()
+        .map(|spec| spec.model_name)
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct BrowserToolSpec {
+    model_name: &'static str,
+    protocol_name: &'static str,
+}
+
+fn browser_tool_specs() -> &'static [BrowserToolSpec] {
+    &[
+        BrowserToolSpec {
+            model_name: "browser_list_tabs",
+            protocol_name: "browser.list_tabs",
+        },
+        BrowserToolSpec {
+            model_name: "browser_snapshot",
+            protocol_name: "browser.snapshot",
+        },
+        BrowserToolSpec {
+            model_name: "browser_probe_node",
+            protocol_name: "browser.probe_node",
+        },
+        BrowserToolSpec {
+            model_name: "browser_screenshot",
+            protocol_name: "browser.screenshot",
+        },
+        BrowserToolSpec {
+            model_name: "browser_click",
+            protocol_name: "browser.click",
+        },
+        BrowserToolSpec {
+            model_name: "browser_fill",
+            protocol_name: "browser.fill",
+        },
+        BrowserToolSpec {
+            model_name: "browser_focus",
+            protocol_name: "browser.focus",
+        },
+        BrowserToolSpec {
+            model_name: "browser_scroll_into_view",
+            protocol_name: "browser.scroll_into_view",
+        },
+        BrowserToolSpec {
+            model_name: "browser_navigate",
+            protocol_name: "browser.navigate",
+        },
+        BrowserToolSpec {
+            model_name: "browser_open_tab",
+            protocol_name: "browser.open_tab",
+        },
+        BrowserToolSpec {
+            model_name: "browser_close_tab",
+            protocol_name: "browser.close_tab",
+        },
+        BrowserToolSpec {
+            model_name: "browser_eval",
+            protocol_name: "browser.eval",
+        },
+        BrowserToolSpec {
+            model_name: "browser_key",
+            protocol_name: "browser.key",
+        },
+        BrowserToolSpec {
+            model_name: "browser_mouse_click",
+            protocol_name: "browser.mouse_click",
+        },
+        BrowserToolSpec {
+            model_name: "browser_mouse_move",
+            protocol_name: "browser.mouse_move",
+        },
+        BrowserToolSpec {
+            model_name: "browser_mouse_down",
+            protocol_name: "browser.mouse_down",
+        },
+        BrowserToolSpec {
+            model_name: "browser_mouse_up",
+            protocol_name: "browser.mouse_up",
+        },
+        BrowserToolSpec {
+            model_name: "browser_mouse_drag",
+            protocol_name: "browser.mouse_drag",
+        },
+        BrowserToolSpec {
+            model_name: "browser_scroll",
+            protocol_name: "browser.scroll",
+        },
+        BrowserToolSpec {
+            model_name: "browser_handle_dialog",
+            protocol_name: "browser.handle_dialog",
+        },
+        BrowserToolSpec {
+            model_name: "browser_handle_file_chooser",
+            protocol_name: "browser.handle_file_chooser",
+        },
+        BrowserToolSpec {
+            model_name: "browser_mark_credential_injection",
+            protocol_name: "browser.mark_credential_injection",
+        },
+        BrowserToolSpec {
+            model_name: "browser_list_credentials",
+            protocol_name: "browser.list_credentials",
+        },
+        BrowserToolSpec {
+            model_name: "browser_fill_credential",
+            protocol_name: "browser.fill_credential",
+        },
+        BrowserToolSpec {
+            model_name: "browser_fill_totp",
+            protocol_name: "browser.fill_totp",
+        },
     ]
+}
+
+fn browser_protocol_tool_name(name: &str) -> Option<&'static str> {
+    browser_tool_specs()
+        .iter()
+        .find(|spec| spec.model_name == name || spec.protocol_name == name)
+        .map(|spec| spec.protocol_name)
 }
 
 pub fn file_tools(files: Arc<FileAccess>) -> Vec<Arc<dyn AgentTool>> {
@@ -269,7 +384,7 @@ pub fn file_tools_for_session(
 }
 
 pub fn file_tool_names() -> Vec<&'static str> {
-    vec!["files.list", "files.read", "files.search", "files.write"]
+    vec!["files_list", "files_read", "files_search", "files_write"]
 }
 
 pub fn memory_tools(memory: Arc<MemoryStore>) -> Vec<Arc<dyn AgentTool>> {
@@ -314,17 +429,19 @@ pub fn local_tool_names() -> Vec<&'static str> {
 
 struct BrowserMediatedTool {
     definition: pie_ai::Tool,
+    protocol_name: &'static str,
     bridge: Arc<dyn BrowserToolBridge>,
 }
 
 impl BrowserMediatedTool {
-    fn new(name: &'static str, bridge: Arc<dyn BrowserToolBridge>) -> Self {
+    fn new(spec: BrowserToolSpec, bridge: Arc<dyn BrowserToolBridge>) -> Self {
         Self {
             definition: pie_ai::Tool {
-                name: name.to_string(),
-                description: browser_tool_description(name).to_string(),
-                parameters: browser_tool_parameters(name),
+                name: spec.model_name.to_string(),
+                description: browser_tool_description(spec.protocol_name).to_string(),
+                parameters: browser_tool_parameters(spec.protocol_name),
             },
+            protocol_name: spec.protocol_name,
             bridge,
         }
     }
@@ -359,7 +476,7 @@ impl AgentTool for BrowserMediatedTool {
     ) -> std::result::Result<AgentToolResult, AgentToolError> {
         let result = self
             .bridge
-            .call_browser_tool(tool_call_id, &self.definition.name, params, cancel)
+            .call_browser_tool(tool_call_id, self.protocol_name, params, cancel)
             .await
             .map_err(|error| AgentToolError::Message(error.to_string()))?;
         if !result.ok {
@@ -488,12 +605,12 @@ impl AgentTool for FileTool {
     ) -> std::result::Result<AgentToolResult, AgentToolError> {
         let params = self.with_default_session_id(params);
         let details = match self.definition.name.as_str() {
-            "files.list" => {
+            "files_list" => {
                 let target = self.files.target_from_params(&params, "path", true).await?;
                 let entries = self.files.list(target).await.map_err(tool_error)?;
                 json!({ "entries": entries })
             }
-            "files.read" => {
+            "files_read" => {
                 let target = self
                     .files
                     .target_from_params(&params, "path", false)
@@ -505,7 +622,7 @@ impl AgentTool for FileTool {
                     .map_err(tool_error)?;
                 json!({ "content": contents })
             }
-            "files.search" => {
+            "files_search" => {
                 let target = self.files.target_from_params(&params, "root", true).await?;
                 let pattern = required_string(&params, "pattern")?;
                 let matches = self
@@ -515,7 +632,7 @@ impl AgentTool for FileTool {
                     .map_err(tool_error)?;
                 json!({ "matches": matches })
             }
-            "files.write" => {
+            "files_write" => {
                 let target = self.files.write_target_from_params(&params).await?;
                 let content = content_bytes(&params)?;
                 let path = self
@@ -1346,15 +1463,11 @@ impl BrainCore {
         let (pie_session, seeded_count) = seed_pie_session(&stored_messages).await?;
         let skills = self.load_skills().await;
         let mut options = AgentHarnessOptions::new(model.clone(), pie_session.clone());
-        options.system_prompt = self.system_prompt().await?;
+        options.system_prompt = self.system_prompt(params.permission_mode).await?;
         options.skills = skills.clone();
         options.tools = self.agent_tools(&session_info.id, &request_id, tx.clone(), skills);
         options.stream_fn = Some(stead_stream_fn(self.auth.clone()));
-        options.thinking_level = if model.reasoning {
-            ThinkingLevel::Medium
-        } else {
-            ThinkingLevel::Off
-        };
+        options.thinking_level = ThinkingLevel::Off;
         options.turn_continuation_cap = Some(0);
 
         let harness = Arc::new(AgentHarness::new(options));
@@ -1652,8 +1765,11 @@ impl BrainCore {
         tools
     }
 
-    async fn system_prompt(&self) -> Result<String> {
+    async fn system_prompt(&self, permission_mode: AgentPermissionMode) -> Result<String> {
         let mut prompt = STEAD_SYSTEM_PROMPT.to_string();
+        prompt.push_str("\n\n<permission_mode>\n");
+        prompt.push_str(permission_mode_prompt(permission_mode));
+        prompt.push_str("\n</permission_mode>");
         for (filename, tag) in [
             ("AGENTS.md", "local_agent_instructions"),
             ("SOUL.md", "local_persona_notes"),
@@ -1993,16 +2109,16 @@ fn browser_tool_parameters(name: &str) -> Value {
 
 fn file_tool_description(name: &str) -> &'static str {
     match name {
-        "files.list" => {
+        "files_list" => {
             "List files inside the current session folder, an approved folder, or full-disk mode."
         }
-        "files.read" => {
+        "files_read" => {
             "Read a capped UTF-8 file inside the current session folder, an approved folder, or full-disk mode."
         }
-        "files.search" => {
+        "files_search" => {
             "Regex-search capped files inside the current session folder, an approved folder, or full-disk mode."
         }
-        "files.write" => {
+        "files_write" => {
             "Write a capped file inside the current session folder, an approved folder, or full-disk mode."
         }
         _ => "Call a scoped Stead file tool.",
@@ -2226,6 +2342,7 @@ fn turn_event_listener(
 fn stead_stream_fn(auth: ProviderAuthStore) -> pie_agent_core::StreamFn {
     Arc::new(move |model, context, options| {
         let mut owned_options = options.cloned().unwrap_or_default();
+        apply_stead_stream_defaults(model, &mut owned_options);
         if owned_options.base.api_key.is_none() {
             if let Some(credential) = auth.credential_for_model(model) {
                 owned_options.base.api_key = Some(credential.api_key);
@@ -2245,6 +2362,12 @@ fn stead_stream_fn(auth: ProviderAuthStore) -> pie_agent_core::StreamFn {
         }
         pie_ai::stream_simple(model, context, Some(&owned_options))
     })
+}
+
+fn apply_stead_stream_defaults(model: &pie_ai::Model, options: &mut pie_ai::SimpleStreamOptions) {
+    if options.base.max_tokens.is_none() && model.max_tokens > 0 {
+        options.base.max_tokens = Some(model.max_tokens.min(DEFAULT_TURN_MAX_OUTPUT_TOKENS));
+    }
 }
 
 fn resolve_model(
@@ -3615,7 +3738,19 @@ fn parse_tool_command(text: &str) -> Option<(String, Value)> {
         .transpose()
         .ok()?
         .unwrap_or_else(|| json!({}));
-    Some((name.to_string(), args))
+    Some((
+        browser_protocol_tool_name(name).unwrap_or(name).to_string(),
+        args,
+    ))
+}
+
+#[cfg(test)]
+fn is_provider_safe_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn default_app_support_dir() -> PathBuf {
@@ -3823,6 +3958,26 @@ mod tests {
         core
     }
 
+    struct NoopBrowserBridge;
+
+    #[async_trait]
+    impl BrowserToolBridge for NoopBrowserBridge {
+        async fn call_browser_tool(
+            &self,
+            _tool_call_id: &str,
+            _name: &str,
+            _arguments: Value,
+            _cancel: CancellationToken,
+        ) -> Result<ToolResultPayload> {
+            Ok(ToolResultPayload {
+                ok: true,
+                content: json!({}),
+                error: None,
+                tainted: false,
+            })
+        }
+    }
+
     fn spawn_http_response(body: String, content_type: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3878,6 +4033,7 @@ mod tests {
                         provider: "faux".to_string(),
                         model: "faux".to_string(),
                     }),
+                    permission_mode: AgentPermissionMode::Read,
                 },
             )
             .await
@@ -3921,7 +4077,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = core.system_prompt().await.unwrap();
+        let prompt = core.system_prompt(AgentPermissionMode::Read).await.unwrap();
         assert!(prompt.contains("<local_agent_instructions>"));
         assert!(prompt.contains("Prefer concise native browser actions."));
         assert!(prompt.contains("<local_persona_notes>"));
@@ -3974,7 +4130,7 @@ mod tests {
             .unwrap();
         assert_eq!(searched.details["matches"][0]["key"], "project-voice");
 
-        let prompt = core.system_prompt().await.unwrap();
+        let prompt = core.system_prompt(AgentPermissionMode::Read).await.unwrap();
         assert!(prompt.contains("<memory>"));
         assert!(prompt.contains("The user prefers direct, low-fluff engineering prose."));
 
@@ -3988,7 +4144,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(forgotten.details["forgotten"]["key"], "project-voice");
-        assert!(!core.system_prompt().await.unwrap().contains("<memory>"));
+        assert!(
+            !core
+                .system_prompt(AgentPermissionMode::Read)
+                .await
+                .unwrap()
+                .contains("<memory>")
+        );
     }
 
     #[tokio::test]
@@ -4333,6 +4495,7 @@ mod tests {
                     text: "hello".to_string(),
                     tab_context: None,
                     model: None,
+                    permission_mode: AgentPermissionMode::Read,
                 },
             )
             .await
@@ -4454,9 +4617,10 @@ mod tests {
                 "r2".to_string(),
                 SendMessageParams {
                     session_id: session.id.clone(),
-                    text: "/tool browser.list_tabs {\"active\":true}".to_string(),
+                    text: "/tool browser_list_tabs {\"active\":true}".to_string(),
                     tab_context: None,
                     model: None,
+                    permission_mode: AgentPermissionMode::Read,
                 },
             )
             .await
@@ -4526,7 +4690,7 @@ mod tests {
         let tools = browser_tools(Arc::new(FakeBridge));
         let tool = tools
             .iter()
-            .find(|tool| tool.definition().name == "browser.list_tabs")
+            .find(|tool| tool.definition().name == "browser_list_tabs")
             .unwrap();
         let result = tool
             .execute(
@@ -4538,6 +4702,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.details["tabs"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn model_visible_tool_names_are_provider_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = Arc::new(
+            FileAccess::new(
+                temp.path().join("agents/main"),
+                FileAccessMode::SessionOnly,
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        let memory = Arc::new(MemoryStore::new(temp.path().join("memory")).await.unwrap());
+        let mut names: Vec<String> = Vec::new();
+        names.extend(
+            browser_tools(Arc::new(NoopBrowserBridge))
+                .into_iter()
+                .map(|tool| tool.definition().name.clone()),
+        );
+        names.extend(
+            file_tools(files)
+                .into_iter()
+                .map(|tool| tool.definition().name.clone()),
+        );
+        names.extend(
+            memory_tools(memory)
+                .into_iter()
+                .map(|tool| tool.definition().name.clone()),
+        );
+        names.extend(
+            local_tools()
+                .into_iter()
+                .map(|tool| tool.definition().name.clone()),
+        );
+
+        for name in names {
+            assert!(
+                is_provider_safe_tool_name(&name),
+                "tool name is not Anthropic/OpenAI safe: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stead_stream_defaults_cap_catalog_max_tokens() {
+        let model = pie_ai::get_model(&pie_ai::Provider::from("anthropic"), "claude-opus-4-6")
+            .expect("anthropic opus fixture model");
+        assert!(model.max_tokens > DEFAULT_TURN_MAX_OUTPUT_TOKENS);
+
+        let mut options = pie_ai::SimpleStreamOptions::default();
+        apply_stead_stream_defaults(&model, &mut options);
+        assert_eq!(
+            options.base.max_tokens,
+            Some(DEFAULT_TURN_MAX_OUTPUT_TOKENS)
+        );
+
+        options.base.max_tokens = Some(1234);
+        apply_stead_stream_defaults(&model, &mut options);
+        assert_eq!(options.base.max_tokens, Some(1234));
     }
 
     #[test]
@@ -4619,7 +4844,7 @@ mod tests {
         let tools = file_tools(Arc::new(core.files().clone()));
         let read = tools
             .iter()
-            .find(|tool| tool.definition().name == "files.read")
+            .find(|tool| tool.definition().name == "files_read")
             .unwrap();
         let denied_approved = read
             .execute(
@@ -4653,7 +4878,7 @@ mod tests {
             file_tools_for_session(Arc::new(core.files().clone()), Some(session.id.clone()));
         let write = session_tools
             .iter()
-            .find(|tool| tool.definition().name == "files.write")
+            .find(|tool| tool.definition().name == "files_write")
             .unwrap();
         let written = write
             .execute(
@@ -4672,7 +4897,7 @@ mod tests {
 
         let session_write = session_tools
             .iter()
-            .find(|tool| tool.definition().name == "files.write")
+            .find(|tool| tool.definition().name == "files_write")
             .unwrap();
         let implicit = session_write
             .execute(
@@ -4714,7 +4939,7 @@ mod tests {
         let tools = file_tools(Arc::new(core.files().clone()));
         let read = tools
             .iter()
-            .find(|tool| tool.definition().name == "files.read")
+            .find(|tool| tool.definition().name == "files_read")
             .unwrap();
         let result = read
             .execute(
@@ -4737,7 +4962,7 @@ mod tests {
         let tools = file_tools(Arc::new(core.files().clone()));
         let read = tools
             .iter()
-            .find(|tool| tool.definition().name == "files.read")
+            .find(|tool| tool.definition().name == "files_read")
             .unwrap();
         let result = read
             .execute(
@@ -4753,6 +4978,9 @@ mod tests {
 
     #[test]
     fn parses_tool_command() {
+        let (name, args) = parse_tool_command("/tool browser_snapshot {\"tab_id\":1}").unwrap();
+        assert_eq!(name, "browser.snapshot");
+        assert_eq!(args["tab_id"], 1);
         let (name, args) = parse_tool_command("/tool browser.snapshot {\"tab_id\":1}").unwrap();
         assert_eq!(name, "browser.snapshot");
         assert_eq!(args["tab_id"], 1);

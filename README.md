@@ -73,11 +73,11 @@ Implemented:
 - `cancel_turn` aborts the active Pie harness for the target session;
 - browser-mediated tool calls over stdio with pending `tool_result` resolution;
 - Pie-facing browser tool catalog routed through a `BrowserToolBridge` trait;
-- capped `browser.screenshot` PNGs become Pie image tool-result blocks, with
+- capped `browser_screenshot` PNGs become Pie image tool-result blocks, with
   base64 stripped from persisted tool details and oversized images reduced to
   metadata;
-- Pie-facing scoped file tools (`files.list`, `files.read`, `files.search`,
-  `files.write`);
+- Pie-facing scoped file tools (`files_list`, `files_read`, `files_search`,
+  `files_write`);
 - Pie-facing memory tool (`memory` with `save`, `list`, `read`, `search`, and
   `forget` actions), scoped to normalized memory keys rather than filesystem
   paths;
