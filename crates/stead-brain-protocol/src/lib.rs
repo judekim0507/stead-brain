@@ -38,9 +38,20 @@ pub struct InitializeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_support_dir: Option<PathBuf>,
     #[serde(default)]
+    pub file_access_mode: FileAccessMode,
+    #[serde(default)]
     pub approved_roots: Vec<PathBuf>,
     #[serde(default)]
     pub dev_allow_config_files: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAccessMode {
+    #[default]
+    SessionOnly,
+    ApprovedRoots,
+    FullDisk,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

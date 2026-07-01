@@ -38,7 +38,7 @@ Implemented:
   tool results, shutdown);
 - app-support session storage under `agents/main/sessions`;
 - per-session `attachments/`, `tmp/`, and `artifacts/` directories;
-- scoped file access for session roots, Downloads, and approved roots;
+- scoped file access with session-only default, explicit approved-root mode, and explicit full-disk mode;
 - symlink-escape rejection and file/search/write caps;
 - real Pie `AgentHarness` turns backed by `pie-ai` provider streaming;
 - Pie provider support compiled for Anthropic, OpenAI Responses,
@@ -92,7 +92,15 @@ Implemented:
 - packaging hook installs the release helper into
   `Stead.app/Contents/MacOS/stead-brain` before app signing.
 
-Session file tools accept either an approved path or a session root alias:
+The current chat session directory is always the working folder. Relative paths
+resolve inside that folder, so normal scratch and output work should look like:
+
+```json
+{"path":"tmp/preview.html","content":"..."}
+{"path":"artifacts/report.docx","content_base64":"..."}
+```
+
+Session file tools also accept explicit root aliases:
 
 ```json
 {"root":"session_tmp","path":"preview.html","content":"..."}
@@ -102,6 +110,12 @@ Session file tools accept either an approved path or a session root alias:
 When a file tool is installed for a chat turn, the current `session_id` is
 supplied automatically for `session_*` roots. Passing an explicit `session_id`
 is still supported for compatibility.
+
+Default file access is `session_only`: no Downloads shortcut and no arbitrary
+absolute paths. `approved_roots` are honored only when the helper is initialized
+with `file_access_mode: "approved_roots"`. `file_access_mode: "full_disk"` is a
+separate explicit mode; even then, relative paths still resolve against the
+current chat session folder.
 
 Deferred until Chromium wiring:
 

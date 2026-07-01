@@ -18,10 +18,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use stead_brain_protocol::{
-    AssistantDone, BrainEvent, CreateSessionParams, ErrorInfo, InitializeParams, ModelCatalogEntry,
-    ModelCatalogProvider, NotificationInfo, PROTOCOL_VERSION, ReadyInfo, ResponseEnvelope,
-    SendMessageParams, SessionInfo, ToolCallEnvelope, ToolResultEnvelope, ToolResultPayload,
-    ToolStatus, UsageUpdate,
+    AssistantDone, BrainEvent, CreateSessionParams, ErrorInfo, FileAccessMode, InitializeParams,
+    ModelCatalogEntry, ModelCatalogProvider, NotificationInfo, PROTOCOL_VERSION, ReadyInfo,
+    ResponseEnvelope, SendMessageParams, SessionInfo, ToolCallEnvelope, ToolResultEnvelope,
+    ToolResultPayload, ToolStatus, UsageUpdate,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -91,12 +91,13 @@ Browser operating rules:
 - Treat tainted browser results as unavailable. Do not try to infer or recover hidden secret values.
 
 File rules:
-- `session_tmp` is for scratch files, previews, scripts, and intermediate work.
-- `session_artifacts` is for durable outputs the user asked you to create, such as documents, PDFs, spreadsheets, or generated data.
-- `session_attachments` is read-only input.
+- Your working folder is the current chat session folder. Treat relative paths as relative to that folder.
+- The session folder contains `attachments/` for read-only user inputs, `tmp/` for scratch files/previews/scripts/intermediate work, and `artifacts/` for durable outputs the user asked you to create.
 - Use `files.write` for both text and binary outputs. For binary files, pass `content_base64`.
+- Put temporary scripts and intermediate data under `tmp/`; put final documents, PDFs, spreadsheets, generated data, and other user-facing outputs under `artifacts/`.
+- Do not write into `attachments/`.
+- By default, file tools can access only the current chat session folder. Approved folders or full-disk access are separate user-granted modes; never assume Downloads or arbitrary local paths are available.
 - When using a `session_*` root, omit `session_id` unless you intentionally need another session; the current chat id is supplied automatically.
-- Do not write outside session roots or approved folders.
 
 Memory rules:
 - Use the `memory` tool only for durable, non-secret facts that should help future sessions.
@@ -157,6 +158,7 @@ pub type Result<T> = std::result::Result<T, BrainError>;
 #[derive(Clone, Debug)]
 pub struct BrainConfig {
     pub app_support_dir: PathBuf,
+    pub file_access_mode: FileAccessMode,
     pub approved_roots: Vec<PathBuf>,
     pub dev_allow_config_files: bool,
 }
@@ -167,6 +169,7 @@ impl BrainConfig {
             app_support_dir: params
                 .app_support_dir
                 .unwrap_or_else(default_app_support_dir),
+            file_access_mode: params.file_access_mode,
             approved_roots: params.approved_roots,
             dev_allow_config_files: params.dev_allow_config_files,
         }
@@ -436,13 +439,26 @@ impl FileTool {
     }
 
     fn with_default_session_id(&self, mut params: Value) -> Value {
-        let needs_default = params
+        let has_session_root = params
             .get("root")
             .and_then(Value::as_str)
             .and_then(SessionRoot::parse)
-            .is_some()
-            && params.get("session_id").is_none();
-        if needs_default {
+            .is_some();
+        let has_relative_path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| !Path::new(path).is_absolute())
+            .unwrap_or(false);
+        let has_relative_search_root = params
+            .get("root")
+            .and_then(Value::as_str)
+            .filter(|root| SessionRoot::parse(root).is_none())
+            .map(|path| !Path::new(path).is_absolute())
+            .unwrap_or(false);
+        let needs_default_session =
+            (has_session_root || has_relative_path || has_relative_search_root)
+                && params.get("session_id").is_none();
+        if needs_default_session {
             if let (Some(session_id), Some(object)) =
                 (self.default_session_id.as_ref(), params.as_object_mut())
             {
@@ -1196,7 +1212,12 @@ impl BrainCore {
         ensure_file_exists(agent_root.join("SOUL.md")).await?;
 
         let sessions = SessionStore::new(agent_root.join("sessions"));
-        let files = FileAccess::new(agent_root.join("sessions"), &config.approved_roots).await?;
+        let files = FileAccess::new(
+            agent_root.join("sessions"),
+            config.file_access_mode,
+            &config.approved_roots,
+        )
+        .await?;
         let memory = MemoryStore::new(agent_root.join("memory")).await?;
         let auth = ProviderAuthStore::open(&agent_root).await?;
         let ready = ReadyInfo {
@@ -1972,10 +1993,18 @@ fn browser_tool_parameters(name: &str) -> Value {
 
 fn file_tool_description(name: &str) -> &'static str {
     match name {
-        "files.list" => "List files inside a session root or explicitly approved folder.",
-        "files.read" => "Read a capped UTF-8 file inside a session root or approved folder.",
-        "files.search" => "Regex-search capped files inside a session root or approved folder.",
-        "files.write" => "Write a capped file under a session root or explicitly approved folder.",
+        "files.list" => {
+            "List files inside the current session folder, an approved folder, or full-disk mode."
+        }
+        "files.read" => {
+            "Read a capped UTF-8 file inside the current session folder, an approved folder, or full-disk mode."
+        }
+        "files.search" => {
+            "Regex-search capped files inside the current session folder, an approved folder, or full-disk mode."
+        }
+        "files.write" => {
+            "Write a capped file inside the current session folder, an approved folder, or full-disk mode."
+        }
         _ => "Call a scoped Stead file tool.",
     }
 }
@@ -2589,6 +2618,14 @@ fn required_string<'a>(
         .ok_or_else(|| AgentToolError::Message(format!("missing string argument `{key}`")))
 }
 
+fn optional_string<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params.get(key).and_then(Value::as_str)
+}
+
+fn agent_tool_to_brain_error(error: AgentToolError) -> BrainError {
+    BrainError::InvalidRequest(error.to_string())
+}
+
 fn web_fetch_max_bytes(params: &Value) -> std::result::Result<usize, AgentToolError> {
     let Some(value) = params.get("max_bytes") else {
         return Ok(WEB_FETCH_DEFAULT_MAX_BYTES);
@@ -2970,6 +3007,7 @@ impl MemoryEntry {
 #[derive(Clone, Debug)]
 pub struct FileAccess {
     session_root: PathBuf,
+    mode: FileAccessMode,
     roots: Vec<ApprovedRoot>,
 }
 
@@ -2981,12 +3019,12 @@ pub struct ApprovedRoot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootKind {
-    Downloads,
     UserApproved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionRoot {
+    WorkingDirectory,
     Attachments,
     Tmp,
     Artifacts,
@@ -2995,6 +3033,7 @@ pub enum SessionRoot {
 impl SessionRoot {
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "session" | "session_workdir" | "session_working_dir" => Some(Self::WorkingDirectory),
             "session_attachments" => Some(Self::Attachments),
             "session_tmp" => Some(Self::Tmp),
             "session_artifacts" => Some(Self::Artifacts),
@@ -3002,11 +3041,12 @@ impl SessionRoot {
         }
     }
 
-    fn dirname(self) -> &'static str {
+    fn dirname(self) -> Option<&'static str> {
         match self {
-            Self::Attachments => "attachments",
-            Self::Tmp => "tmp",
-            Self::Artifacts => "artifacts",
+            Self::WorkingDirectory => None,
+            Self::Attachments => Some("attachments"),
+            Self::Tmp => Some("tmp"),
+            Self::Artifacts => Some("artifacts"),
         }
     }
 }
@@ -3029,27 +3069,26 @@ pub struct WriteTarget {
 }
 
 impl FileAccess {
-    async fn new(session_root: PathBuf, approved_roots: &[PathBuf]) -> Result<Self> {
+    async fn new(
+        session_root: PathBuf,
+        mode: FileAccessMode,
+        approved_roots: &[PathBuf],
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(&session_root).await?;
         let mut roots = Vec::new();
-        if let Some(downloads) = downloads_dir() {
-            if downloads.exists() {
+        if mode == FileAccessMode::ApprovedRoots {
+            for root in approved_roots {
                 roots.push(ApprovedRoot {
-                    path: canonicalize_existing(&downloads).await?,
-                    kind: RootKind::Downloads,
+                    path: canonicalize_existing(root).await?,
+                    kind: RootKind::UserApproved,
                 });
             }
-        }
-        for root in approved_roots {
-            roots.push(ApprovedRoot {
-                path: canonicalize_existing(root).await?,
-                kind: RootKind::UserApproved,
-            });
         }
         roots.sort_by(|a, b| a.path.cmp(&b.path));
         roots.dedup_by(|a, b| a.path == b.path);
         Ok(Self {
             session_root: canonicalize_existing(&session_root).await?,
+            mode,
             roots,
         })
     }
@@ -3177,9 +3216,8 @@ impl FileAccess {
             return Ok(FileTarget { path });
         }
 
-        let path = required_string(params, path_key)?;
         let path = self
-            .resolve_existing(Path::new(path))
+            .resolve_general_existing(params, path_key, allow_empty_session_path)
             .await
             .map_err(tool_error)?;
         Ok(FileTarget { path })
@@ -3208,12 +3246,51 @@ impl FileAccess {
             return Ok(WriteTarget { path });
         }
 
-        let path = required_string(params, "path")?;
         let path = self
-            .resolve_approved_write(Path::new(path))
+            .resolve_general_write(params, "path")
             .await
             .map_err(tool_error)?;
         Ok(WriteTarget { path })
+    }
+
+    async fn resolve_general_existing(
+        &self,
+        params: &Value,
+        path_key: &str,
+        allow_empty_session_path: bool,
+    ) -> Result<PathBuf> {
+        let raw = required_string(params, path_key).map_err(agent_tool_to_brain_error)?;
+        let path = Path::new(raw);
+        if path.is_relative() {
+            let session_id = optional_string(params, "session_id").ok_or_else(|| {
+                BrainError::FileAccessDenied(
+                    "relative paths require the current session".to_string(),
+                )
+            })?;
+            if raw.is_empty() && !allow_empty_session_path {
+                return Err(BrainError::FileAccessDenied("path is empty".to_string()));
+            }
+            return self
+                .resolve_session_existing(session_id, SessionRoot::WorkingDirectory, raw)
+                .await;
+        }
+        self.resolve_existing(path).await
+    }
+
+    async fn resolve_general_write(&self, params: &Value, path_key: &str) -> Result<PathBuf> {
+        let raw = required_string(params, path_key).map_err(agent_tool_to_brain_error)?;
+        let path = Path::new(raw);
+        if path.is_relative() {
+            let session_id = optional_string(params, "session_id").ok_or_else(|| {
+                BrainError::FileAccessDenied(
+                    "relative paths require the current session".to_string(),
+                )
+            })?;
+            return self
+                .resolve_session_write(session_id, SessionRoot::WorkingDirectory, raw)
+                .await;
+        }
+        self.resolve_approved_write(path).await
     }
 
     async fn resolve_session_existing(
@@ -3244,6 +3321,11 @@ impl FileAccess {
     ) -> Result<PathBuf> {
         let base = self.session_base(session_id, root).await?;
         let rel = safe_relative_path(rel, false)?;
+        if root == SessionRoot::WorkingDirectory && relative_path_starts_with(&rel, "attachments") {
+            return Err(BrainError::FileAccessDenied(
+                "attachments are read-only for the agent".to_string(),
+            ));
+        }
         let out = base.join(rel);
         let parent = out
             .parent()
@@ -3281,7 +3363,10 @@ impl FileAccess {
         if !is_safe_session_id(session_id) {
             return Err(BrainError::InvalidRequest("invalid session id".to_string()));
         }
-        let base = self.session_root.join(session_id).join(root.dirname());
+        let mut base = self.session_root.join(session_id);
+        if let Some(dirname) = root.dirname() {
+            base = base.join(dirname);
+        }
         tokio::fs::create_dir_all(&base).await?;
         let canonical = canonicalize_existing(&base).await?;
         if canonical.starts_with(&self.session_root) {
@@ -3297,9 +3382,9 @@ impl FileAccess {
     async fn ensure_existing_output_does_not_escape(&self, out: &Path) -> Result<()> {
         if tokio::fs::symlink_metadata(&out).await.is_ok() {
             let canonical_out = canonicalize_existing(&out).await?;
-            if !self.is_allowed(&canonical_out) && !canonical_out.starts_with(&self.session_root) {
+            if !self.is_allowed(&canonical_out) {
                 return Err(BrainError::FileAccessDenied(format!(
-                    "{} escapes approved roots",
+                    "{} escapes allowed file roots",
                     out.display()
                 )));
             }
@@ -3313,16 +3398,24 @@ impl FileAccess {
             Ok(canonical)
         } else {
             Err(BrainError::FileAccessDenied(format!(
-                "{} is outside approved roots",
+                "{} is outside the current file access mode",
                 path.display()
             )))
         }
     }
 
     fn is_allowed(&self, canonical: &Path) -> bool {
-        self.roots
-            .iter()
-            .any(|root| canonical.starts_with(&root.path))
+        if canonical.starts_with(&self.session_root) {
+            return true;
+        }
+        match self.mode {
+            FileAccessMode::SessionOnly => false,
+            FileAccessMode::ApprovedRoots => self
+                .roots
+                .iter()
+                .any(|root| canonical.starts_with(&root.path)),
+            FileAccessMode::FullDisk => true,
+        }
     }
 }
 
@@ -3534,12 +3627,6 @@ fn default_app_support_dir() -> PathBuf {
         .join("Stead")
 }
 
-fn downloads_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Downloads"))
-}
-
 async fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
     tokio::fs::canonicalize(path).await.map_err(Into::into)
 }
@@ -3688,6 +3775,13 @@ fn safe_relative_path(value: &str, allow_empty: bool) -> Result<PathBuf> {
     Ok(out)
 }
 
+fn relative_path_starts_with(path: &Path, dirname: &str) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Normal(part)) if part == OsStr::new(dirname)
+    )
+}
+
 #[allow(dead_code)]
 fn _protocol_version_marker() -> u32 {
     PROTOCOL_VERSION
@@ -3708,11 +3802,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use stead_brain_protocol::{ModelSelection, TabContext, ToolResultPayload};
+    use stead_brain_protocol::{FileAccessMode, ModelSelection, TabContext, ToolResultPayload};
 
     async fn initialized(temp: &tempfile::TempDir) -> BrainCore {
+        initialized_with_file_mode(temp, FileAccessMode::SessionOnly).await
+    }
+
+    async fn initialized_with_file_mode(
+        temp: &tempfile::TempDir,
+        file_access_mode: FileAccessMode,
+    ) -> BrainCore {
         let (core, _) = BrainCore::initialize(InitializeParams {
             app_support_dir: Some(temp.path().join("Stead")),
+            file_access_mode,
             approved_roots: vec![temp.path().join("approved")],
             dev_allow_config_files: false,
         })
@@ -4374,7 +4476,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("secret.txt"), approved.join("escape.txt"))
             .unwrap();
 
-        let core = initialized(&temp).await;
+        let core = initialized_with_file_mode(&temp, FileAccessMode::ApprovedRoots).await;
         #[cfg(unix)]
         assert!(matches!(
             core.files()
@@ -4519,16 +4621,15 @@ mod tests {
             .iter()
             .find(|tool| tool.definition().name == "files.read")
             .unwrap();
-        let result = read
+        let denied_approved = read
             .execute(
                 "call_1",
                 json!({ "path": approved.join("note.txt") }),
                 CancellationToken::new(),
                 None,
             )
-            .await
-            .unwrap();
-        assert_eq!(result.details["content"], "alpha\nbeta");
+            .await;
+        assert!(denied_approved.is_err());
 
         let denied = read
             .execute(
@@ -4548,7 +4649,9 @@ mod tests {
             panic!("expected session_created");
         };
 
-        let write = tools
+        let session_tools =
+            file_tools_for_session(Arc::new(core.files().clone()), Some(session.id.clone()));
+        let write = session_tools
             .iter()
             .find(|tool| tool.definition().name == "files.write")
             .unwrap();
@@ -4556,9 +4659,7 @@ mod tests {
             .execute(
                 "call_3",
                 json!({
-                    "root": "session_tmp",
-                    "session_id": session.id,
-                    "path": "preview.html",
+                    "path": "tmp/preview.html",
                     "content": "<p>preview</p>"
                 }),
                 CancellationToken::new(),
@@ -4569,8 +4670,6 @@ mod tests {
         let written_path = written.details["path"].as_str().unwrap();
         assert!(written_path.ends_with("/tmp/preview.html"));
 
-        let session_tools =
-            file_tools_for_session(Arc::new(core.files().clone()), Some(session.id.clone()));
         let session_write = session_tools
             .iter()
             .find(|tool| tool.definition().name == "files.write")
@@ -4590,6 +4689,66 @@ mod tests {
             .unwrap();
         let implicit_path = implicit.details["path"].as_str().unwrap();
         assert!(implicit_path.ends_with("/tmp/implicit-session.txt"));
+
+        let attachment_write = session_write
+            .execute(
+                "call_5",
+                json!({
+                    "path": "attachments/should-not-write.txt",
+                    "content": "no"
+                }),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(attachment_write.is_err());
+    }
+
+    #[tokio::test]
+    async fn approved_root_mode_allows_explicit_approved_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let approved = temp.path().join("approved");
+        fs::create_dir_all(&approved).unwrap();
+        fs::write(approved.join("note.txt"), "alpha\nbeta").unwrap();
+        let core = initialized_with_file_mode(&temp, FileAccessMode::ApprovedRoots).await;
+        let tools = file_tools(Arc::new(core.files().clone()));
+        let read = tools
+            .iter()
+            .find(|tool| tool.definition().name == "files.read")
+            .unwrap();
+        let result = read
+            .execute(
+                "approved_read",
+                json!({ "path": approved.join("note.txt") }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.details["content"], "alpha\nbeta");
+    }
+
+    #[tokio::test]
+    async fn full_disk_mode_allows_canonicalized_absolute_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        fs::write(&outside, "full disk fixture").unwrap();
+        let core = initialized_with_file_mode(&temp, FileAccessMode::FullDisk).await;
+        let tools = file_tools(Arc::new(core.files().clone()));
+        let read = tools
+            .iter()
+            .find(|tool| tool.definition().name == "files.read")
+            .unwrap();
+        let result = read
+            .execute(
+                "full_disk_read",
+                json!({ "path": outside }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.details["content"], "full disk fixture");
     }
 
     #[test]

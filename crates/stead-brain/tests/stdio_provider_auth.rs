@@ -40,6 +40,7 @@ impl Helper {
                 "request_id": "init",
                 "type": "initialize",
                 "app_support_dir": app_support_dir,
+                "file_access_mode": "session_only",
                 "approved_roots": [],
                 "dev_allow_config_files": true
             }))
