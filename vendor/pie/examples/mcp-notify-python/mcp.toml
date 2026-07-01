@@ -1,0 +1,19 @@
+# Example pie MCP server registry — drop this (or the matching `[[server]]` block) into
+# either of pie's two mcp.toml locations:
+#
+#   ~/.pie/mcp.toml             # user-global, applies to every pie run on this machine
+#   <repo>/.pie/mcp.toml        # project-local, only applies when running pie from <repo>
+#                                 (project entries override same-named user entries)
+#
+# The path in `args` is relative to the cwd pie is launched from. Replace it with an
+# absolute path if you want the entry to work regardless of where you run pie. Example:
+#
+#   args = ["/abs/path/to/pie/examples/mcp-notify-python/notify-server.py"]
+
+[[server]]
+# `name` becomes the source label `mcp:<name>` and the prefix on every minted
+# idempotency key (e.g. `mcp:demo-notify:custom:heartbeat:1`). It must be unique
+# across all configured MCP servers.
+name = "demo-notify"
+command = "python3"
+args = ["./examples/mcp-notify-python/notify-server.py"]
