@@ -182,6 +182,18 @@ pub struct ReadyInfo {
     pub brain_version: String,
     pub pie_commit: String,
     pub app_support_dir: PathBuf,
+    /// Skill catalog snapshot (names/descriptions only, no skill bodies) so
+    /// UI surfaces can offer @-mention discovery without a extra round trip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    /// "builtin" or "user".
+    pub source: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +393,7 @@ mod tests {
                 brain_version: "0.1.0".into(),
                 pie_commit: "abc".into(),
                 app_support_dir: "/tmp/stead".into(),
+                skills: vec![],
             }),
         );
         let encoded = encode_response_line(&response).unwrap();

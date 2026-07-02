@@ -1339,10 +1339,23 @@ impl BrainCore {
         .await?;
         let memory = MemoryStore::new(agent_root.join("memory")).await?;
         let auth = ProviderAuthStore::open(&agent_root).await?;
+        let skill_infos = load_stead_skills(agent_root.join("skills"))
+            .await
+            .into_iter()
+            .map(|skill| stead_brain_protocol::SkillInfo {
+                name: skill.name,
+                description: skill.description,
+                source: match skill.source {
+                    SkillSource::User => "user".to_string(),
+                    _ => "builtin".to_string(),
+                },
+            })
+            .collect();
         let ready = ReadyInfo {
             brain_version: BRAIN_VERSION.to_string(),
             pie_commit: pie_commit().to_string(),
             app_support_dir: config.app_support_dir.clone(),
+            skills: skill_infos,
         };
         Ok((
             Self {
