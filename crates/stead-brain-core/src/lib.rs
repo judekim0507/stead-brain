@@ -429,6 +429,26 @@ pub fn local_tool_names() -> Vec<&'static str> {
     vec!["get_time", "WebFetch"]
 }
 
+fn tool_allowed_in_read_mode(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_list_tabs"
+            | "browser_snapshot"
+            | "browser_probe_node"
+            | "browser_screenshot"
+            | "browser_scroll_into_view"
+            | "browser_scroll"
+            | "browser_list_credentials"
+            | "files_list"
+            | "files_read"
+            | "files_search"
+            | "get_time"
+            | "WebFetch"
+            | "ask_user"
+            | "notification"
+    )
+}
+
 struct BrowserMediatedTool {
     definition: pie_ai::Tool,
     protocol_name: &'static str,
@@ -1497,13 +1517,22 @@ impl BrainCore {
 
         let model = resolve_model(params.model.as_ref())?;
         self.auth.prepare_model_credential(&model).await?;
+        self.sessions
+            .ensure_title_from_prompt(&session_info.id, &params.text)
+            .await?;
         let stored_messages = self.sessions.messages(&session_info.id).await?;
         let (pie_session, seeded_count) = seed_pie_session(&stored_messages).await?;
         let skills = self.load_skills().await;
         let mut options = AgentHarnessOptions::new(model.clone(), pie_session.clone());
         options.system_prompt = self.system_prompt(params.permission_mode).await?;
         options.skills = skills.clone();
-        options.tools = self.agent_tools(&session_info.id, &request_id, tx.clone(), skills);
+        options.tools = self.agent_tools(
+            &session_info.id,
+            &request_id,
+            tx.clone(),
+            skills,
+            params.permission_mode,
+        );
         options.stream_fn = Some(stead_stream_fn(self.auth.clone()));
         options.thinking_level = ThinkingLevel::Off;
         options.turn_continuation_cap = Some(0);
@@ -1777,6 +1806,7 @@ impl BrainCore {
         request_id: &str,
         tx: mpsc::UnboundedSender<ResponseEnvelope>,
         skills: Vec<Skill>,
+        permission_mode: AgentPermissionMode,
     ) -> Vec<Arc<dyn AgentTool>> {
         let bridge = Arc::new(ProtocolBrowserToolBridge {
             session_id: session_id.to_string(),
@@ -1799,6 +1829,9 @@ impl BrainCore {
         tools.extend(local_tools());
         if !skills.is_empty() {
             tools.push(Arc::new(SkillInvocationTool::new(skills)) as Arc<dyn AgentTool>);
+        }
+        if permission_mode == AgentPermissionMode::Read {
+            tools.retain(|tool| tool_allowed_in_read_mode(&tool.definition().name));
         }
         tools
     }
@@ -2531,8 +2564,26 @@ async fn seed_pie_session(messages: &[StoredMessage]) -> Result<(Session, usize)
     let storage = Arc::new(MemorySessionStorage::new()) as Arc<dyn SessionStorage>;
     let session = Session::new(storage);
     let mut seeded = 0usize;
+    let mut available_tool_calls = std::collections::HashSet::new();
     for message in messages {
         if let Some(agent_message) = agent_message_from_stored(message) {
+            if let AgentMessage::Llm(pie_ai::Message::Assistant(assistant)) = &agent_message {
+                available_tool_calls.extend(assistant.content.iter().filter_map(|block| {
+                    if let pie_ai::ContentBlock::ToolCall(call) = block {
+                        Some(call.id.clone())
+                    } else {
+                        None
+                    }
+                }));
+            }
+            if let AgentMessage::Llm(pie_ai::Message::ToolResult(result)) = &agent_message {
+                // Older Stead builds persisted tool results but flattened the
+                // matching assistant tool calls into display text. Replaying
+                // those orphaned results makes Responses reject the next turn.
+                if !available_tool_calls.contains(&result.tool_call_id) {
+                    continue;
+                }
+            }
             session
                 .append_message(agent_message)
                 .await
@@ -2563,10 +2614,16 @@ fn agent_message_from_stored(message: &StoredMessage) -> Option<AgentMessage> {
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let content = message
+                .metadata
+                .get("content_blocks")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| vec![pie_ai::ContentBlock::text(message.content.clone())]);
             Some(AgentMessage::Llm(pie_ai::Message::Assistant(
                 pie_ai::AssistantMessage {
                     role: pie_ai::AssistantRole::Assistant,
-                    content: vec![pie_ai::ContentBlock::text(message.content.clone())],
+                    content,
                     api: pie_ai::Api::from(
                         message
                             .metadata
@@ -2633,10 +2690,12 @@ fn stored_message_from_agent(message: AgentMessage) -> Option<(String, String, V
             user_content_to_text(&user.content),
             json!({}),
         )),
-        AgentMessage::Llm(pie_ai::Message::Assistant(assistant)) => Some((
-            "assistant".to_string(),
-            assistant_content_to_text(&assistant.content),
-            json!({
+        AgentMessage::Llm(pie_ai::Message::Assistant(assistant)) => {
+            let content_blocks = serde_json::to_value(&assistant.content).unwrap_or(Value::Null);
+            Some((
+                "assistant".to_string(),
+                assistant_content_to_text(&assistant.content),
+                json!({
                 "api": assistant.api.0,
                 "provider": assistant.provider.0,
                 "model": assistant.model,
@@ -2644,6 +2703,7 @@ fn stored_message_from_agent(message: AgentMessage) -> Option<(String, String, V
                 "response_id": assistant.response_id,
                 "stop_reason": stop_reason_string(assistant.stop_reason),
                 "error": assistant.error_message,
+                "content_blocks": content_blocks,
                 "usage": {
                     "input": assistant.usage.input,
                     "output": assistant.usage.output,
@@ -2651,8 +2711,9 @@ fn stored_message_from_agent(message: AgentMessage) -> Option<(String, String, V
                     "cache_write": assistant.usage.cache_write,
                     "total_tokens": assistant.usage.total_tokens
                 }
-            }),
-        )),
+                }),
+            ))
+        }
         AgentMessage::Llm(pie_ai::Message::ToolResult(tool)) => Some((
             "tool".to_string(),
             user_blocks_to_text(&tool.content),
@@ -2945,6 +3006,21 @@ impl SessionStore {
         write_json(info.path.join("meta.json"), &meta).await
     }
 
+    async fn ensure_title_from_prompt(&self, session_id: &str, prompt: &str) -> Result<()> {
+        let info = self.load(session_id).await?;
+        let mut meta = read_json::<SessionMeta>(info.path.join("meta.json")).await?;
+        if meta.title != "New chat" {
+            return Ok(());
+        }
+        let title = title_from_prompt(prompt);
+        if title == "New chat" {
+            return Ok(());
+        }
+        meta.title = title;
+        meta.updated_at = Utc::now();
+        write_json(info.path.join("meta.json"), &meta).await
+    }
+
     pub async fn messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let info = self.load(session_id).await?;
         let data = tokio::fs::read_to_string(info.path.join("messages.jsonl")).await?;
@@ -2954,6 +3030,34 @@ impl SessionStore {
         }
         Ok(messages)
     }
+}
+
+fn title_from_prompt(prompt: &str) -> String {
+    const MAX_CHARS: usize = 56;
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "New chat".to_string();
+    }
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut title = String::new();
+    for word in normalized.split_whitespace() {
+        let next_len =
+            title.chars().count() + usize::from(!title.is_empty()) + word.chars().count();
+        if next_len > MAX_CHARS.saturating_sub(1) {
+            break;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(word);
+    }
+    if title.is_empty() {
+        title = normalized.chars().take(MAX_CHARS - 1).collect();
+    }
+    title.push('…');
+    title
 }
 
 #[derive(Clone, Debug)]
@@ -4888,6 +4992,96 @@ mod tests {
             }
             other => panic!("expected text block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chat_title_comes_from_first_prompt() {
+        assert_eq!(
+            title_from_prompt("  summarize   this page  "),
+            "summarize this page"
+        );
+        let title = title_from_prompt(
+            "Compare every visible laptop on this page and explain the important differences in detail",
+        );
+        assert!(title.ends_with('…'));
+        assert!(title.chars().count() <= 56);
+    }
+
+    #[test]
+    fn read_mode_excludes_mutating_and_agentic_tools() {
+        for allowed in [
+            "browser_snapshot",
+            "browser_scroll",
+            "files_read",
+            "WebFetch",
+            "ask_user",
+        ] {
+            assert!(tool_allowed_in_read_mode(allowed), "{allowed}");
+        }
+        for blocked in [
+            "browser_click",
+            "browser_fill",
+            "browser_navigate",
+            "browser_open_tab",
+            "browser_eval",
+            "files_write",
+            "memory",
+            "Skill",
+        ] {
+            assert!(!tool_allowed_in_read_mode(blocked), "{blocked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_tool_calls_rehydrate_with_matching_results() {
+        let now = Utc::now();
+        let call = pie_ai::ContentBlock::ToolCall(pie_ai::ToolCall {
+            id: "call_1".to_string(),
+            name: "browser.snapshot".to_string(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+        });
+        let assistant = StoredMessage {
+            role: "assistant".to_string(),
+            content: "[tool call]".to_string(),
+            created_at: now,
+            metadata: json!({
+                "provider": "openai-codex",
+                "model": "gpt-5.4",
+                "api": "openai-codex-responses",
+                "stop_reason": "tool_use",
+                "content_blocks": [call]
+            }),
+        };
+        let result = StoredMessage {
+            role: "tool".to_string(),
+            content: "page contents".to_string(),
+            created_at: now,
+            metadata: json!({
+                "tool_call_id": "call_1",
+                "tool_name": "browser.snapshot",
+                "is_error": false
+            }),
+        };
+        let (session, seeded) = seed_pie_session(&[assistant, result]).await.unwrap();
+        assert_eq!(seeded, 2);
+        assert_eq!(session.entries().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_orphaned_tool_results_are_not_replayed() {
+        let result = StoredMessage {
+            role: "tool".to_string(),
+            content: "legacy result".to_string(),
+            created_at: Utc::now(),
+            metadata: json!({
+                "tool_call_id": "missing_call",
+                "tool_name": "browser.snapshot"
+            }),
+        };
+        let (session, seeded) = seed_pie_session(&[result]).await.unwrap();
+        assert_eq!(seeded, 0);
+        assert!(session.entries().await.unwrap().is_empty());
     }
 
     #[tokio::test]
