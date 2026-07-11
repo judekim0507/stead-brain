@@ -28,6 +28,8 @@ const CODEX_FALLBACK_PORT: u16 = 1457;
 const AUTH_STORE_ENV: &str = "STEAD_BRAIN_AUTH_STORE";
 const AUTH_STORE_FILE: &str = "file";
 const KEYCHAIN_SERVICE: &str = "com.stead.browser.brain.provider-auth";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct ProviderAuthStore {
@@ -112,8 +114,35 @@ impl ProviderAuthStore {
         let auth_dir = agent_root.join("auth");
         tokio::fs::create_dir_all(&auth_dir).await?;
         let legacy_path = auth_dir.join("provider_credentials.json");
-        let storage = AuthStorage::new(agent_root, legacy_path);
-        let state = storage.load().await?;
+        let preferred_storage = AuthStorage::new(agent_root, legacy_path.clone());
+
+        #[cfg(target_os = "macos")]
+        let (storage, state) = if matches!(&preferred_storage, AuthStorage::Keychain { .. }) {
+            let fallback = AuthStorage::File { path: legacy_path };
+            let fallback_state = fallback.load().await?;
+            if !fallback_state.providers.is_empty() {
+                (fallback, fallback_state)
+            } else {
+                match tokio::time::timeout(KEYCHAIN_STARTUP_TIMEOUT, preferred_storage.load()).await
+                {
+                    Ok(Ok(state)) => (preferred_storage, state),
+                    // Ad-hoc development builds can lose access to an existing Keychain
+                    // item when their code identity changes. Never let that OS prompt
+                    // freeze the entire brain; use the private legacy file store for
+                    // this process and allow the user to import credentials again.
+                    Ok(Err(_)) | Err(_) => (fallback, fallback_state),
+                }
+            }
+        } else {
+            let state = preferred_storage.load().await?;
+            (preferred_storage, state)
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let (storage, state) = {
+            let state = preferred_storage.load().await?;
+            (preferred_storage, state)
+        };
         Ok(Self {
             storage,
             state: Arc::new(RwLock::new(state)),
