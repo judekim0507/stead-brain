@@ -135,7 +135,11 @@ async fn drive_loop(
         }
 
         // Whether to continue based on stop_reason + queue + tool-terminate hint.
-        let continues = matches!(assistant.stop_reason, pie_ai::StopReason::ToolUse);
+        // Tool-call content is authoritative. Some Responses-compatible providers
+        // report `stop` even when the assistant emitted function calls; after those
+        // tools run, the model still needs another turn to consume their results.
+        let continues = !tool_results.is_empty()
+            || matches!(assistant.stop_reason, pie_ai::StopReason::ToolUse);
         if !tool_results.is_empty() && all_terminate {
             return Ok(());
         }

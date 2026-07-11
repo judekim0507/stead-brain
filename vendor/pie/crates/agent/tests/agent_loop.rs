@@ -218,6 +218,84 @@ async fn tool_call_loops_until_non_tool_use_stop() {
 }
 
 #[tokio::test]
+async fn tool_call_loops_when_provider_reports_stop() {
+    let mut args = serde_json::Map::new();
+    args.insert("x".into(), serde_json::json!(1));
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "call_stop".into(),
+                name: "echo_stop".into(),
+                arguments: args,
+                thought_signature: None,
+            })],
+            StopReason::Stop,
+        ),
+        assistant_with(vec![ContentBlock::text("finished")], StopReason::Stop),
+    ]));
+
+    struct EchoTool {
+        def: pie_ai::Tool,
+    }
+    #[async_trait::async_trait]
+    impl AgentTool for EchoTool {
+        fn definition(&self) -> &pie_ai::Tool {
+            &self.def
+        }
+        fn label(&self) -> &str {
+            "echo_stop"
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _cancel: CancellationToken,
+            _on_update: Option<pie_agent_core::AgentToolUpdate>,
+        ) -> Result<pie_agent_core::AgentToolResult, pie_agent_core::AgentToolError> {
+            Ok(pie_agent_core::AgentToolResult {
+                content: vec![pie_ai::UserContentBlock::text("tool finished")],
+                details: serde_json::Value::Null,
+                terminate: None,
+            })
+        }
+    }
+
+    let mut state = AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![Arc::new(EchoTool {
+        def: pie_ai::Tool {
+            name: "echo_stop".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+    })];
+    let agent = Agent::new(AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        ..Default::default()
+    });
+
+    agent
+        .prompt(AgentMessage::Llm(pie_ai::Message::User(
+            pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("compute".into()),
+                timestamp: 0,
+            },
+        )))
+        .await
+        .unwrap();
+
+    let state = agent.state();
+    assert_eq!(state.messages.len(), 4);
+    assert!(matches!(
+        state.messages.last(),
+        Some(AgentMessage::Llm(pie_ai::Message::Assistant(message)))
+            if message.content.iter().any(|block| matches!(block, ContentBlock::Text(text) if text.text == "finished"))
+    ));
+}
+
+#[tokio::test]
 async fn before_tool_call_can_veto_execution() {
     use pie_agent_core::{BeforeToolCallContext, BeforeToolCallResult};
 

@@ -155,6 +155,10 @@ pub enum BrainEvent {
     },
     SessionLoaded {
         session: SessionInfo,
+        #[serde(default)]
+        messages: Vec<SessionMessage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelSelection>,
     },
     AssistantDelta {
         text: String,
@@ -203,6 +207,15 @@ pub struct SessionInfo {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub metadata: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

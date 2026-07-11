@@ -1414,10 +1414,33 @@ impl BrainCore {
         session_id: String,
     ) -> Result<Vec<ResponseEnvelope>> {
         let session = self.sessions.load(&session_id).await?;
+        let stored_messages = self.sessions.messages(&session_id).await?;
+        let model = stored_messages.iter().rev().find_map(|message| {
+            if message.role != "assistant" {
+                return None;
+            }
+            Some(stead_brain_protocol::ModelSelection {
+                provider: message.metadata.get("provider")?.as_str()?.to_string(),
+                model: message.metadata.get("model")?.as_str()?.to_string(),
+            })
+        });
+        let messages = stored_messages
+            .into_iter()
+            .map(|message| stead_brain_protocol::SessionMessage {
+                role: message.role,
+                content: message.content,
+                created_at: message.created_at,
+                metadata: message.metadata,
+            })
+            .collect();
         Ok(vec![ResponseEnvelope::session_event(
             Some(request_id),
             session_id,
-            BrainEvent::SessionLoaded { session },
+            BrainEvent::SessionLoaded {
+                session,
+                messages,
+                model,
+            },
         )])
     }
 
@@ -4073,6 +4096,23 @@ mod tests {
         assert_eq!(messages[1].content, "[faux] hello");
         assert_eq!(messages[1].metadata["provider"], "faux");
         assert_eq!(messages[1].metadata["model"], "faux");
+
+        let loaded = core
+            .load_session("r4".to_string(), session.id.clone())
+            .await
+            .unwrap();
+        let BrainEvent::SessionLoaded {
+            messages: loaded_messages,
+            model,
+            ..
+        } = &loaded[0].event
+        else {
+            panic!("expected session_loaded");
+        };
+        assert_eq!(loaded_messages.len(), 2);
+        assert_eq!(loaded_messages[0].content, "hello");
+        assert_eq!(model.as_ref().unwrap().provider, "faux");
+        assert_eq!(model.as_ref().unwrap().model, "faux");
         assert!(session.path.join("attachments").is_dir());
         assert!(session.path.join("tmp").is_dir());
         assert!(session.path.join("artifacts").is_dir());
