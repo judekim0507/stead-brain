@@ -78,6 +78,8 @@ pub struct SendMessageParams {
     #[serde(default)]
     pub tab_context: Option<TabContext>,
     #[serde(default)]
+    pub tab_contexts: Vec<TabContext>,
+    #[serde(default)]
     pub model: Option<ModelSelection>,
     #[serde(default)]
     pub permission_mode: AgentPermissionMode,
