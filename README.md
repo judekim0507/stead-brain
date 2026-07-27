@@ -56,10 +56,11 @@ Implemented:
   plus import from `$CODEX_HOME/auth.json` / `~/.codex/auth.json`;
 - stream-time credential injection into `pie-ai`, including Anthropic OAuth bearer
   mode and Codex `chatgpt-account-id` propagation;
-- explicit model resolution from Pie's model catalog, with no silent fake fallback
-  for normal user turns;
-- `list_models` protocol events backed by Pie's compiled model catalog, including
-  provider auth capabilities for Claude, Codex, OpenAI, and Gemini;
+- explicit model resolution from Pie for standard providers and Codex's own cached
+  catalog for ChatGPT-authenticated Codex models, with no silent fake fallback;
+- `list_models` protocol events backed by Codex's current model cache for Codex and
+  Pie's compiled catalog for Claude, OpenAI, and Gemini, including provider auth
+  capabilities;
 - local `AGENTS.md` / `SOUL.md` files under `agents/main/` are created and
   merged into the run system prompt when populated;
 - persistent non-secret memory under `agents/main/memory/`, exposed through the
@@ -72,7 +73,13 @@ Implemented:
 - streamed assistant deltas, usage updates, tool statuses, and final stop events;
 - `cancel_turn` aborts the active Pie harness for the target session;
 - browser-mediated tool calls over stdio with pending `tool_result` resolution;
-- Pie-facing browser tool catalog routed through a `BrowserToolBridge` trait;
+- one Pie-facing `browser_exec` tool backed by a persistent per-chat,
+  memory-bounded QuickJS runtime with Playwright-compatible `page`, `context`,
+  semantic locator, screenshot, mouse, keyboard, evaluation, dialog, file
+  chooser, and credential APIs;
+- Playwright-style operations lowered through a `BrowserToolBridge` trait to
+  individually gated and audited native Chromium primitives rather than stock
+  Playwright or a model-visible CDP surface;
 - capped `browser_screenshot` PNGs become Pie image tool-result blocks, with
   base64 stripped from persisted tool details and oversized images reduced to
   metadata;
