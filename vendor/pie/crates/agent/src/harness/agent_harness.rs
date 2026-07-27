@@ -809,7 +809,14 @@ pub struct AgentHarnessOptions {
     pub prompt_templates: Vec<PromptTemplate>,
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub session: Session,
+    /// Stable identifier for this conversation, forwarded to the provider as a
+    /// prompt cache key. Successive turns replay the same prefix, so without it
+    /// they are never routed to the same cache.
+    pub session_id: Option<String>,
     pub stream_fn: Option<StreamFn>,
+    /// Optional ephemeral context rewrite run immediately before every provider call,
+    /// including calls made while consuming tool results inside one prompt cycle.
+    pub transform_context: Option<TransformContext>,
     /// Auto-compaction thresholds. Defaults to [`DEFAULT_COMPACTION_SETTINGS`].
     pub compaction: CompactionSettings,
     /// Optional `before_tool_call` hook. Wire a `PermissionPolicy::as_before_tool_call()` here
@@ -879,7 +886,9 @@ impl AgentHarnessOptions {
             prompt_templates: Vec::new(),
             tools: Vec::new(),
             session,
+            session_id: None,
             stream_fn: None,
+            transform_context: None,
             compaction: DEFAULT_COMPACTION_SETTINGS.clone(),
             before_tool_call: None,
             after_tool_call: None,
@@ -1002,9 +1011,14 @@ impl AgentHarness {
         let agent = Agent::new(AgentOptions {
             initial_state: Some(state),
             stream_fn: options.stream_fn.clone(),
+            transform_context: options.transform_context.clone(),
             before_tool_call: options.before_tool_call.clone(),
             after_tool_call: options.after_tool_call.clone(),
             on_control_plane_prompt: options.on_control_plane_prompt.clone(),
+            // Providers key their prompt cache on this. Leaving it unset means
+            // successive turns of one session are never even offered to the
+            // same cache, which is the one case where the whole prefix repeats.
+            session_id: options.session_id.clone(),
             ..Default::default()
         });
 
