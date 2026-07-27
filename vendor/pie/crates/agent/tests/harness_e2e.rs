@@ -106,6 +106,51 @@ async fn prompt_persists_user_and_assistant_to_session() {
 }
 
 #[tokio::test]
+async fn harness_transform_context_runs_before_each_provider_call_without_mutating_session() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let saw_rewrite = Arc::new(AtomicBool::new(false));
+    let saw_rewrite_in_stream = saw_rewrite.clone();
+    let delegate = faux_stream_fn("done");
+
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.transform_context = Some(Arc::new(|mut messages, _cancel| {
+        Box::pin(async move {
+            if let Some(AgentMessage::Llm(pie_ai::Message::User(user))) = messages.last_mut() {
+                user.content = pie_ai::UserContent::Text("rewritten for provider".into());
+            }
+            messages
+        })
+    }));
+    opts.stream_fn = Some(Arc::new(move |model, context, options| {
+        let rewritten = context.messages.iter().any(|message| {
+            matches!(
+                message,
+                pie_ai::Message::User(user)
+                    if matches!(&user.content, pie_ai::UserContent::Text(text) if text == "rewritten for provider")
+            )
+        });
+        saw_rewrite_in_stream.store(rewritten, Ordering::SeqCst);
+        delegate(model, context, options)
+    }));
+
+    let harness = AgentHarness::new(opts);
+    harness.prompt("original user text").await.unwrap();
+    assert!(saw_rewrite.load(Ordering::SeqCst));
+
+    let entries = session.entries().await.unwrap();
+    assert!(entries.iter().any(|entry| {
+        matches!(
+            entry,
+            SessionTreeEntry::Message {
+                message: AgentMessage::Llm(pie_ai::Message::User(user)),
+                ..
+            } if matches!(&user.content, pie_ai::UserContent::Text(text) if text == "original user text")
+        )
+    }));
+}
+
+#[tokio::test]
 async fn prompt_reports_session_persistence_failures() {
     struct FailingAppendStorage;
 

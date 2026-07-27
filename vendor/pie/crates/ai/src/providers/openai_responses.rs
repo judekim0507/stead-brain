@@ -560,7 +560,12 @@ fn update_usage(usage: &mut Usage, val: &Value) {
     {
         usage.cache_write += n;
     }
-    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+    // OpenAI reports cached tokens as a subset of `input_tokens`, not an
+    // additional bucket. Adding them again inflates context estimates and cost.
+    usage.total_tokens = val
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(usage.input + usage.output);
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────
@@ -728,6 +733,26 @@ pub(crate) fn convert_messages(
                     "call_id": tr.tool_call_id,
                     "output": text_parts.join("\n"),
                 }));
+
+                // Responses function-call outputs are textual, but custom browser
+                // harnesses can return visual observations. Preserve those images as
+                // the immediately-following user input so multimodal models actually
+                // see the screenshot associated with this tool call.
+                let mut visual_content = vec![json!({
+                    "type": "input_text",
+                    "text": format!("Visual observation returned by {} (tool call {}).", tr.tool_name, tr.tool_call_id),
+                })];
+                visual_content.extend(tr.content.iter().filter_map(|block| match block {
+                    UserContentBlock::Image(image) => Some(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", image.mime_type, image.data),
+                        "detail": "original",
+                    })),
+                    UserContentBlock::Text(_) => None,
+                }));
+                if visual_content.len() > 1 {
+                    out.push(json!({ "role": "user", "content": visual_content }));
+                }
             }
         }
     }
@@ -1018,6 +1043,7 @@ mod tests {
         );
         assert_eq!(usage.cache_read, 80);
         assert_eq!(usage.cache_write, 20);
+        assert_eq!(usage.total_tokens, 110);
     }
 
     #[test]
@@ -1057,5 +1083,34 @@ mod tests {
         assert_eq!(fc["call_id"], "call_123");
         assert_eq!(fc["name"], "calc");
         assert!(fc["arguments"].as_str().unwrap().contains("\"x\":1"));
+    }
+
+    #[test]
+    fn tool_result_images_are_forwarded_as_multimodal_input() {
+        let messages = vec![Message::ToolResult(ToolResultMessage {
+            role: ToolResultRole::ToolResult,
+            tool_call_id: "call_screenshot".into(),
+            tool_name: "browser_screenshot".into(),
+            content: vec![
+                UserContentBlock::text("Captured the visible viewport."),
+                UserContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                }),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })];
+
+        let input = convert_messages(&messages, None, false);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][1]["type"], "input_image");
+        assert_eq!(input[1]["content"][1]["detail"], "original");
+        assert_eq!(
+            input[1]["content"][1]["image_url"],
+            "data:image/png;base64,aGVsbG8="
+        );
     }
 }
