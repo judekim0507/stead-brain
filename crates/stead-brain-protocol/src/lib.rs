@@ -83,6 +83,19 @@ pub struct SendMessageParams {
     pub model: Option<ModelSelection>,
     #[serde(default)]
     pub permission_mode: AgentPermissionMode,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    #[default]
+    High,
+    Xhigh,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +174,11 @@ pub enum BrainEvent {
         messages: Vec<SessionMessage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelSelection>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<ArtifactInfo>,
+    },
+    SessionTitleUpdated {
+        title: String,
     },
     AssistantDelta {
         text: String,
@@ -221,10 +239,24 @@ pub struct SessionMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    /// Path relative to the session root, always under `artifacts/`.
+    pub path: String,
+    /// Display name relative to the `artifacts/` directory.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantDone {
     pub stop_reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Authoritative artifact snapshot after this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactInfo>,
+    /// Artifacts that did not exist when this turn began.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_artifacts: Vec<ArtifactInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

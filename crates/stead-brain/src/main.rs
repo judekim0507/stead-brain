@@ -1,8 +1,8 @@
 use anyhow::Context;
 use stead_brain_core::{BrainCore, BrainError, make_error};
 use stead_brain_protocol::{
-    BrainEvent, BrowserRequest, PROTOCOL_VERSION, ResponseEnvelope, encode_response_line,
-    parse_request_line,
+    BrainEvent, BrowserRequest, ErrorInfo, PROTOCOL_VERSION, ResponseEnvelope,
+    encode_response_line, parse_request_line,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(core_ref) => {
                     let core = core_ref.clone();
                     let request_id_for_error = request_id.clone();
+                    let session_id_for_error = params.session_id.clone();
                     let tx = out_tx.clone();
                     tokio::spawn(async move {
                         if let Err(error) = core
@@ -67,10 +68,13 @@ async fn main() -> anyhow::Result<()> {
                         {
                             send_response(
                                 &tx,
-                                make_error(
+                                ResponseEnvelope::session_event(
                                     Some(request_id_for_error),
-                                    error_code(&error),
-                                    error.to_string(),
+                                    session_id_for_error,
+                                    BrainEvent::Error(ErrorInfo {
+                                        code: error_code(&error).to_string(),
+                                        message: error.to_string(),
+                                    }),
                                 ),
                             );
                         }

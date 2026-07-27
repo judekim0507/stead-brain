@@ -85,6 +85,49 @@ impl Helper {
 }
 
 #[tokio::test]
+async fn missing_codex_auth_error_is_scoped_to_the_chat_session() {
+    let dir = TempDir::new().expect("temp app support");
+    let mut helper = Helper::start(dir.path()).await;
+
+    helper
+        .send(json!({
+            "protocol_version": 1,
+            "request_id": "create",
+            "type": "create_session",
+            "title": "Auth test",
+            "origin_surface": "test"
+        }))
+        .await;
+    let created = helper.next_event().await;
+    let session_id = created["session"]["id"]
+        .as_str()
+        .expect("created session id")
+        .to_string();
+
+    helper
+        .send(json!({
+            "protocol_version": 1,
+            "request_id": "send",
+            "type": "send_message",
+            "session_id": session_id,
+            "text": "hello",
+            "model": {
+                "provider": "openai-codex",
+                "model": "gpt-5.3-codex"
+            },
+            "permission_mode": "read"
+        }))
+        .await;
+    let failed = helper.next_event().await;
+    assert_eq!(failed["type"], "error");
+    assert_eq!(failed["request_id"], "send");
+    assert_eq!(failed["session_id"], session_id);
+    assert_eq!(failed["code"], "provider_auth_failed");
+
+    helper.shutdown().await;
+}
+
+#[tokio::test]
 async fn api_key_auth_over_stdio_never_echoes_secret() {
     let dir = TempDir::new().expect("temp app support");
     let mut helper = Helper::start(dir.path()).await;
@@ -233,13 +276,12 @@ async fn model_catalog_over_stdio_uses_real_provider_capabilities() {
             .iter()
             .any(|model| model["id"] == "claude-opus-4-6")
     );
+    let codex_models = codex["models"].as_array().expect("codex models");
     assert!(
-        codex["models"]
-            .as_array()
-            .expect("codex models")
-            .iter()
-            .any(|model| model["id"] == "gpt-5.3-codex")
+        !codex_models.is_empty(),
+        "the live Codex catalog should expose at least one model"
     );
+    assert!(codex_models.iter().all(|model| model["reasoning"] == true));
 
     helper.shutdown().await;
 }
