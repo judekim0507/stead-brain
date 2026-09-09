@@ -6,13 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 description = "Transport-agnostic Chrome DevTools Protocol client (fd-pair and WebSocket transports)."
 
+[features]
+default = ["ws"]
+ws = ["dep:tokio-tungstenite"]
+
 [dependencies]
-anyhow.workspace = true
+async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite = { workspace = true, optional = true }
 
-[dev-dependencies]
-tempfile.workspace = true
+[lints]
+workspace = true
