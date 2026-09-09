@@ -1,7 +1,7 @@
 # Vendored Playwright in-page scripts
 
 Source: `playwright-core` 1.63.0 (Apache-2.0, see LICENSE), files
-`lib/generated/injectedScriptSource` and `utilityScriptSource` as embedded in
+`lib/generated/injectedScriptSource` (embedded as `source4`) and `utilityScriptSource` (embedded as `source3`) in
 `lib/coreBundle.js`. Extracted verbatim by evaluating the embedded string
 literals (`scratchpad/pw/extract.js`); no modifications.
 

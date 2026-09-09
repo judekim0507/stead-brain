@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Steadwright fixtures</title>
+  </head>
+  <body>
+    <main>
+      <h1>Steadwright fixture index</h1>
+      <button id="toggle" type="button">before click</button>
+    </main>
+    <script>
+      document.querySelector('#toggle').addEventListener('click', event => {
+        event.currentTarget.textContent = 'after click';
+      });
+    </script>
+  </body>
+</html>

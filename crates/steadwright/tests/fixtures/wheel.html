@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Wheel fixture</title>
+    <style>
+      html, body { margin: 0; }
+      main { height: 5000px; }
+      button { margin: 80px; width: 180px; height: 60px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <button id="toggle" type="button">before click</button>
+    </main>
+    <script>
+      document.querySelector('#toggle').addEventListener('click', event => {
+        event.currentTarget.textContent = 'after click';
+      });
+    </script>
+  </body>
+</html>

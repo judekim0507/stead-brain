@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>SPA fixture</title>
+  </head>
+  <body>
+    <button id="push-state" type="button">push state</button>
+    <script>
+      document.querySelector('#push-state').addEventListener('click', () => {
+        history.pushState({ fixture: true }, '', '/spa.html?navigated=yes');
+      });
+    </script>
+  </body>
+</html>
