@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Roles</title></head>
+<body>
+  <h1>Role fixtures</h1>
+  <h2>Secondary heading</h2>
+  <h3>Third heading</h3>
+  <button id="toggle" data-testid="toggle" type="button">Submit</button>
+  <button id="disabled" type="button" disabled>Disabled action</button>
+  <button id="pressed" type="button" aria-pressed="true">Bold</button>
+  <button id="expanded" type="button" aria-expanded="false">Details</button>
+  <button id="fetcher" type="button">Fetch data</button>
+  <a href="#destination" title="Destination">Go somewhere</a>
+  <label for="email">Email address</label>
+  <input id="email" placeholder="name@example.test" alt="email input">
+  <label><input id="agree" type="checkbox" checked> Accept terms</label>
+  <div role="radiogroup" aria-label="Choice"><label><input type="radio" name="choice" value="one"> One</label><label><input type="radio" name="choice" value="two"> Two</label></div>
+  <select aria-label="List"><option>Alpha</option><option>Beta</option></select>
+  <button hidden>Hidden action</button>
+  <button id="covered" type="button">Covered</button>
+  <div id="overlay" style="position:absolute;left:0;top:0;width:1px;height:1px"></div>
+  <p id="status">before</p>
+  <script>
+    document.querySelector('#toggle').addEventListener('click', () => { const status = document.querySelector('#status'); status.textContent = status.textContent === 'before' ? 'after' : 'before'; });
+    document.querySelector('#covered').addEventListener('click', event => event.currentTarget.dataset.clicked = 'yes');
+    document.querySelector('#fetcher').addEventListener('click', () => fetch('/slow?ms=50'));
+  </script>
+</body>
+</html>

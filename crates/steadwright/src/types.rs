@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::ElementHandle;
 use crate::JsHandle;
 use serde_json::Value;
 
@@ -103,6 +104,14 @@ pub struct Response {
     pub status: u16,
     pub ok: bool,
     pub headers: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Request {
+    pub url: String,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub post_data: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -210,6 +219,175 @@ pub struct ConsoleMessage {
 #[derive(Clone, Debug)]
 pub struct PageError {
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BoundingBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyboardModifier {
+    Alt,
+    Control,
+    Meta,
+    Shift,
+}
+
+impl KeyboardModifier {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Alt => "Alt",
+            Self::Control => "Control",
+            Self::Meta => "Meta",
+            Self::Shift => "Shift",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ActionOptions {
+    pub button: MouseButton,
+    pub click_count: u8,
+    pub delay: Option<Duration>,
+    pub position: Option<Point>,
+    pub modifiers: Vec<KeyboardModifier>,
+    pub force: bool,
+    pub no_wait_after: bool,
+    pub trial: bool,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for ActionOptions {
+    fn default() -> Self {
+        Self {
+            button: MouseButton::Left,
+            click_count: 1,
+            delay: None,
+            position: None,
+            modifiers: Vec::new(),
+            force: false,
+            no_wait_after: false,
+            trial: false,
+            timeout: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LocatorFilter {
+    pub has_text: Option<crate::TextMatch>,
+    pub has_not_text: Option<crate::TextMatch>,
+    pub has: Option<crate::Locator>,
+    pub has_not: Option<crate::Locator>,
+    pub visible: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaitForSelectorState {
+    Attached,
+    Detached,
+    #[default]
+    Visible,
+    Hidden,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WaitForOptions {
+    pub state: WaitForSelectorState,
+    pub timeout: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Polling {
+    #[default]
+    Raf,
+    Interval(Duration),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WaitForFunctionOptions {
+    pub polling: Polling,
+    pub timeout: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SelectOptionValue {
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub index: Option<usize>,
+    pub element: Option<ElementHandle>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePayload {
+    pub name: String,
+    pub mime_type: String,
+    pub buffer: Vec<u8>,
+    pub last_modified_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum PageEvent {
+    Download(crate::Download),
+    Dialog(crate::Dialog),
+    FileChooser(crate::FileChooser),
+    Popup(crate::Page),
+}
+
+#[derive(Clone, Debug)]
+pub enum InputFiles {
+    Paths(Vec<PathBuf>),
+    Payloads(Vec<FilePayload>),
+}
+
+impl From<Vec<PathBuf>> for InputFiles {
+    fn from(value: Vec<PathBuf>) -> Self {
+        Self::Paths(value)
+    }
+}
+
+impl From<Vec<FilePayload>> for InputFiles {
+    fn from(value: Vec<FilePayload>) -> Self {
+        Self::Payloads(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AriaSnapshotMode {
+    #[default]
+    Ai,
+    Default,
+}
+
+#[derive(Clone, Debug)]
+pub struct AriaSnapshotOptions {
+    pub mode: AriaSnapshotMode,
+    pub depth: Option<u32>,
+    pub boxes: bool,
+    pub selector: Option<String>,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for AriaSnapshotOptions {
+    fn default() -> Self {
+        Self {
+            mode: AriaSnapshotMode::Ai,
+            depth: None,
+            boxes: false,
+            selector: None,
+            timeout: None,
+        }
+    }
 }
 
 /// A JavaScript value as represented by Playwright's evaluation protocol.
@@ -331,6 +509,26 @@ impl From<JsValue> for CallArg {
 impl From<Value> for CallArg {
     fn from(value: Value) -> Self {
         Self::Value(value.into())
+    }
+}
+impl From<&str> for CallArg {
+    fn from(value: &str) -> Self {
+        Self::Value(JsValue::String(value.to_owned()))
+    }
+}
+impl From<String> for CallArg {
+    fn from(value: String) -> Self {
+        Self::Value(JsValue::String(value))
+    }
+}
+impl From<bool> for CallArg {
+    fn from(value: bool) -> Self {
+        Self::Value(JsValue::Bool(value))
+    }
+}
+impl From<u64> for CallArg {
+    fn from(value: u64) -> Self {
+        Self::Value(JsValue::Number(value as f64))
     }
 }
 impl From<&JsHandle> for CallArg {

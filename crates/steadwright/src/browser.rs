@@ -12,9 +12,9 @@ use tokio::sync::Notify;
 
 use crate::{
     CallArg, ConsoleMessage, DEFAULT_TIMEOUT, Deadline, DialogType, Error, GotoOptions,
-    IntoTimeout, JsValue, Keyboard, LoadState, Mouse, PageError, Response, Result,
-    ScreenshotFormat, ScreenshotOptions, ScreenshotScale, Touchscreen, UrlMatcher, ViewportSize,
-    WaitForUrlOptions, World,
+    IntoTimeout, JsValue, Keyboard, LoadState, Mouse, PageError, PageEvent, Request, Response,
+    Result, ScreenshotFormat, ScreenshotOptions, ScreenshotScale, Touchscreen, UrlMatcher,
+    ViewportSize, WaitForUrlOptions, World,
 };
 
 const UTILITY_WORLD: &str = "__steadwright";
@@ -121,6 +121,7 @@ struct TargetData {
     initialized: bool,
     reported: bool,
     page: Option<Page>,
+    opener_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -189,6 +190,9 @@ struct PageState {
     loader_requests: HashMap<String, String>,
     responses: HashMap<String, Response>,
     failures: HashMap<String, String>,
+    network_sequence: u64,
+    request_events: Vec<(u64, Request)>,
+    response_events: Vec<(u64, Response)>,
 }
 
 #[derive(Clone)]
@@ -213,17 +217,17 @@ struct ContextData {
 
 #[derive(Clone)]
 pub struct Frame {
-    page: Page,
-    id: String,
+    pub(crate) page: Page,
+    pub(crate) id: String,
 }
 
 #[derive(Clone)]
 pub struct JsHandle {
-    page: Page,
-    remote_object: Value,
-    session_id: String,
-    context_id: u64,
-    frame_id: String,
+    pub(crate) page: Page,
+    pub(crate) remote_object: Value,
+    pub(crate) session_id: String,
+    pub(crate) context_id: u64,
+    pub(crate) frame_id: String,
     disposed: Arc<Mutex<bool>>,
 }
 
@@ -641,6 +645,9 @@ impl Page {
                     loader_requests: HashMap::new(),
                     responses: HashMap::new(),
                     failures: HashMap::new(),
+                    network_sequence: 0,
+                    request_events: Vec::new(),
+                    response_events: Vec::new(),
                 }),
                 notify: Notify::new(),
                 dialog_handlers: Mutex::new(Vec::new()),
@@ -683,13 +690,13 @@ impl Page {
     fn browser(&self) -> Result<Arc<BrowserInner>> {
         self.inner.browser.upgrade().ok_or(Error::TargetClosed)
     }
-    fn default_timeout(&self) -> Duration {
+    pub(crate) fn default_timeout(&self) -> Duration {
         self.inner.state.lock().unwrap().default_timeout
     }
     fn navigation_timeout(&self) -> Duration {
         self.inner.state.lock().unwrap().default_navigation_timeout
     }
-    fn deadline(&self, timeout: Option<Duration>, navigation: bool) -> Deadline {
+    pub(crate) fn deadline(&self, timeout: Option<Duration>, navigation: bool) -> Deadline {
         Deadline::new(timeout.unwrap_or_else(|| {
             if navigation {
                 self.navigation_timeout()
@@ -711,6 +718,35 @@ impl Page {
         Frame {
             page: self.clone(),
             id,
+        }
+    }
+    pub(crate) fn main_session_id(&self) -> &str {
+        &self.inner.main_session
+    }
+    pub(crate) fn navigation_generation(&self) -> u64 {
+        self.inner.state.lock().unwrap().navigation_generation
+    }
+    pub(crate) async fn wait_for_action_navigation(
+        &self,
+        before: u64,
+        deadline: Deadline,
+    ) -> Result<()> {
+        // CDP has no single "navigation scheduled" event. Give events queued by the
+        // input dispatch a brief chance to commit, then reuse the normal load waiter.
+        let signal_deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            if self.navigation_generation() > before {
+                return self
+                    .wait_for_load_state(LoadState::Load, Some(deadline.remaining()))
+                    .await;
+            }
+            if Instant::now() >= signal_deadline || deadline.expired() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = self.inner.notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+            }
         }
     }
     pub fn frames(&self) -> Vec<Frame> {
@@ -846,6 +882,77 @@ impl Page {
                 }
             })
             .await
+    }
+    /// Registers synchronously, so constructing this future before an action cannot miss a response.
+    pub fn wait_for_response(
+        &self,
+        matcher: UrlMatcher,
+        timeout: Option<Duration>,
+    ) -> impl std::future::Future<Output = Result<Response>> + Send + 'static {
+        let page = self.clone();
+        let first_sequence = self.inner.state.lock().unwrap().network_sequence + 1;
+        let deadline = self.deadline(timeout, false);
+        async move {
+            deadline
+                .run("page.wait_for_response", async {
+                    loop {
+                        let response = {
+                            let state = page.inner.state.lock().unwrap();
+                            state
+                                .response_events
+                                .iter()
+                                .find(|(sequence, response)| {
+                                    *sequence >= first_sequence && matcher.matches(&response.url)
+                                })
+                                .map(|(_, response)| response.clone())
+                        };
+                        if let Some(response) = response {
+                            return Ok(response);
+                        }
+                        if page.is_closed() {
+                            return Err(Error::TargetClosed);
+                        }
+                        wait_change(&page.inner.notify).await;
+                    }
+                })
+                .await
+        }
+    }
+
+    /// Registers synchronously, so constructing this future before an action cannot miss a request.
+    pub fn wait_for_request(
+        &self,
+        matcher: UrlMatcher,
+        timeout: Option<Duration>,
+    ) -> impl std::future::Future<Output = Result<Request>> + Send + 'static {
+        let page = self.clone();
+        let first_sequence = self.inner.state.lock().unwrap().network_sequence + 1;
+        let deadline = self.deadline(timeout, false);
+        async move {
+            deadline
+                .run("page.wait_for_request", async {
+                    loop {
+                        let request = {
+                            let state = page.inner.state.lock().unwrap();
+                            state
+                                .request_events
+                                .iter()
+                                .find(|(sequence, request)| {
+                                    *sequence >= first_sequence && matcher.matches(&request.url)
+                                })
+                                .map(|(_, request)| request.clone())
+                        };
+                        if let Some(request) = request {
+                            return Ok(request);
+                        }
+                        if page.is_closed() {
+                            return Err(Error::TargetClosed);
+                        }
+                        wait_change(&page.inner.notify).await;
+                    }
+                })
+                .await
+        }
     }
     pub async fn set_viewport_size(&self, width: u32, height: u32) -> Result<()> {
         self.send_main(
@@ -1074,6 +1181,65 @@ impl Page {
             .push(Arc::new(handler));
     }
 
+    /// Registers before returning the future, preserving the wait-before-action pattern.
+    pub fn wait_for_event(
+        &self,
+        event: &str,
+        timeout: Option<Duration>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PageEvent>> + Send + 'static>>
+    {
+        let deadline = self.deadline(timeout, false);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        match event {
+            "download" => self.on_download(move |download| {
+                let _ = sender.send(PageEvent::Download(download));
+            }),
+            "dialog" => self.on_dialog(move |dialog| {
+                if sender.send(PageEvent::Dialog(dialog.clone())).is_err() {
+                    tokio::spawn(async move {
+                        let _ = dialog.dismiss().await;
+                    });
+                }
+            }),
+            "filechooser" => self.on_file_chooser(move |chooser| {
+                let _ = sender.send(PageEvent::FileChooser(chooser));
+            }),
+            "popup" => match self.browser() {
+                Ok(browser) => {
+                    let source_id = self.inner.target_id.clone();
+                    let filter = browser.clone();
+                    Browser { inner: browser }.on_target(move |popup| {
+                        let is_popup = filter
+                            .targets
+                            .read()
+                            .unwrap()
+                            .get(&popup.inner.target_id)
+                            .is_some_and(|target| target.opener_id.as_deref() == Some(&source_id));
+                        if is_popup {
+                            let _ = sender.send(PageEvent::Popup(popup));
+                        }
+                    });
+                }
+                Err(error) => return Box::pin(async move { Err(error) }),
+            },
+            _ => {
+                let event = event.to_owned();
+                return Box::pin(async move {
+                    Err(Error::InvalidArgument(format!(
+                        "Unsupported page event: {event}"
+                    )))
+                });
+            }
+        }
+        Box::pin(async move {
+            deadline
+                .run("page.wait_for_event", async {
+                    receiver.recv().await.ok_or(Error::TargetClosed)
+                })
+                .await
+        })
+    }
+
     pub(crate) async fn send_main(&self, method: &str, params: Value) -> Result<Value> {
         let browser = self.browser()?;
         browser
@@ -1083,7 +1249,12 @@ impl Page {
             .await
             .map_err(Into::into)
     }
-    async fn send_session(&self, session: &str, method: &str, params: Value) -> Result<Value> {
+    pub(crate) async fn send_session(
+        &self,
+        session: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
         self.browser()?
             .connection
             .session(session.to_owned())
@@ -1105,6 +1276,42 @@ impl Frame {
     }
     pub fn is_detached(&self) -> bool {
         self.data().is_none_or(|v| v.detached)
+    }
+    pub(crate) fn owner_session(&self) -> Result<String> {
+        self.data()
+            .map(|frame| frame.owner_session)
+            .ok_or(Error::FrameDetached)
+    }
+    pub(crate) fn same_frame(&self, other: &Frame) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.page.inner, &other.page.inner)
+    }
+    pub(crate) fn frame_by_sequence(&self, sequence: u32) -> Option<Frame> {
+        self.page
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .frames
+            .iter()
+            .find(|(_, frame)| frame.seq == sequence && !frame.detached)
+            .map(|(id, _)| Frame {
+                page: self.page.clone(),
+                id: id.clone(),
+            })
+    }
+    pub(crate) fn frame_by_id(&self, frame_id: &str) -> Option<Frame> {
+        self.page
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .frames
+            .get(frame_id)
+            .filter(|frame| !frame.detached)
+            .map(|_| Frame {
+                page: self.page.clone(),
+                id: frame_id.to_owned(),
+            })
     }
     pub fn parent_frame(&self) -> Option<Frame> {
         self.data()?.parent.map(|id| Frame {
@@ -1257,6 +1464,17 @@ impl Frame {
             .await?;
         Ok(self.make_handle(remote, session, context))
     }
+    pub(crate) async fn evaluate_handle_args(
+        &self,
+        expression: &str,
+        args: Vec<CallArg>,
+    ) -> Result<JsHandle> {
+        let (context, session, _, _) = self.context_snapshot(World::Main).await?;
+        let (_, remote) = self
+            .evaluate_with_context(expression, args, false, context, &session)
+            .await?;
+        Ok(self.make_handle(remote, session, context))
+    }
     async fn evaluate_impl(
         &self,
         expression: &str,
@@ -1366,7 +1584,12 @@ impl Frame {
             frame.seq,
         ))
     }
-    fn make_handle(&self, remote_object: Value, session_id: String, context_id: u64) -> JsHandle {
+    pub(crate) fn make_handle(
+        &self,
+        remote_object: Value,
+        session_id: String,
+        context_id: u64,
+    ) -> JsHandle {
         JsHandle {
             page: self.page.clone(),
             remote_object,
@@ -2103,10 +2326,15 @@ fn update_target_info(browser: &Arc<BrowserInner>, info: &Value) -> Option<Strin
                 initialized: false,
                 reported: false,
                 page: None,
+                opener_id: None,
             });
         target.type_ = type_;
         target.url = url;
         target.context_id = context_id.clone();
+        target.opener_id = info
+            .get("openerId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let Some(attached) = attached {
             target.attached = attached;
             if !attached {
@@ -2785,7 +3013,53 @@ fn handle_request(page: &Page, params: &Value) {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let request = params.get("request");
     let mut state = page.inner.state.lock().unwrap();
+    if let Some(request) = request {
+        state.network_sequence += 1;
+        let sequence = state.network_sequence;
+        let headers = request
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|headers| {
+                headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        state.request_events.push((
+            sequence,
+            Request {
+                url: request
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                method: request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                headers,
+                post_data: request
+                    .get("postData")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+        ));
+        if state.request_events.len() > 512 {
+            state.request_events.drain(..256);
+        }
+    }
     if resource_type == "Document" {
         state.loader_requests.insert(loader_id, request_id.clone());
     }
@@ -2829,19 +3103,25 @@ fn handle_response(page: &Page, params: &Value) {
                 .collect()
         })
         .unwrap_or_default();
-    page.inner.state.lock().unwrap().responses.insert(
-        request_id,
-        Response {
-            url: response
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            status,
-            ok: (200..400).contains(&status),
-            headers,
-        },
-    );
+    let response = Response {
+        url: response
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        status,
+        ok: (200..400).contains(&status),
+        headers,
+    };
+    let mut state = page.inner.state.lock().unwrap();
+    state.responses.insert(request_id, response.clone());
+    state.network_sequence += 1;
+    let sequence = state.network_sequence;
+    state.response_events.push((sequence, response));
+    if state.response_events.len() > 512 {
+        state.response_events.drain(..256);
+    }
+    drop(state);
     page.inner.notify.notify_waiters();
 }
 
