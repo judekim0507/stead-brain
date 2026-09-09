@@ -39,6 +39,7 @@ struct ConnectionInner {
     pending: Mutex<HashMap<u64, PendingRequest>>,
     events: broadcast::Sender<Event>,
     closed: AtomicBool,
+    closed_reason: Mutex<Option<String>>,
 }
 
 struct PendingRequest {
@@ -56,6 +57,7 @@ impl Connection {
             pending: Mutex::new(HashMap::new()),
             events,
             closed: AtomicBool::new(false),
+            closed_reason: Mutex::new(None),
         });
         tokio::spawn(read_messages(Arc::downgrade(&inner), incoming));
         Self { inner }
@@ -106,8 +108,13 @@ impl Connection {
     }
 
     pub async fn close(&self) {
-        self.inner.disconnect();
+        self.inner.disconnect("closed by client");
         self.inner.transport.lock().await.close().await;
+    }
+
+    /// Returns why the connection closed, or `None` while it is live.
+    pub fn closed_reason(&self) -> Option<String> {
+        self.inner.closed_reason.lock().unwrap().clone()
     }
 
     async fn start_request(
@@ -152,7 +159,7 @@ impl Connection {
 
         if let Err(error) = self.inner.transport.lock().await.send(message).await {
             self.inner.pending.lock().unwrap().remove(&id);
-            self.inner.disconnect();
+            self.inner.disconnect(error.to_string());
             return Err(error.into());
         }
 
@@ -180,10 +187,11 @@ impl std::future::Future for PendingResponse {
 }
 
 impl ConnectionInner {
-    fn disconnect(&self) {
+    fn disconnect(&self, reason: impl Into<String>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        *self.closed_reason.lock().unwrap() = Some(reason.into());
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
         for (_, request) in pending {
             let _ = request.completed.send(Err(CdpError::Disconnected));
@@ -201,15 +209,15 @@ async fn read_messages(
         };
         let message = match message {
             Ok(message) => message,
-            Err(_) => {
-                connection.disconnect();
+            Err(error) => {
+                connection.disconnect(error.to_string());
                 return;
             }
         };
         let parsed: Value = match serde_json::from_str(&message) {
             Ok(parsed) => parsed,
-            Err(_) => {
-                connection.disconnect();
+            Err(error) => {
+                connection.disconnect(format!("invalid CDP message: {error}"));
                 return;
             }
         };
@@ -247,7 +255,7 @@ async fn read_messages(
     }
 
     if let Some(connection) = connection.upgrade() {
-        connection.disconnect();
+        connection.disconnect("transport closed");
     }
 }
 
@@ -422,5 +430,9 @@ mod tests {
             pending.await.unwrap(),
             Err(CdpError::Disconnected)
         ));
+        assert_eq!(
+            connection.closed_reason().as_deref(),
+            Some("transport closed")
+        );
     }
 }

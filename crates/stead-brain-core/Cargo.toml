@@ -23,6 +23,7 @@ steadwright-cdp = { path = "../steadwright-cdp" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 

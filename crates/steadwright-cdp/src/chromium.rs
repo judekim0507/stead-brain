@@ -142,9 +142,43 @@ pub async fn launch(options: LaunchOptions) -> Result<LaunchedChromium, LaunchEr
     };
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
 
+    if let Some(pid) = child.id() {
+        register_exit_kill(pid);
+    }
     Ok(LaunchedChromium {
         ws_url,
         child,
         temporary_profile,
     })
+}
+
+/// Pids of launched browsers, killed when this process exits normally.
+///
+/// Test fixtures commonly keep a `LaunchedChromium` in a static, which is
+/// never dropped, and `libtest` exits via `process::exit`, so `Drop` alone
+/// leaks a headless browser per test binary. `atexit` runs on that path.
+static EXIT_KILL_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+#[allow(unsafe_code)]
+fn register_exit_kill(pid: u32) {
+    let mut pids = EXIT_KILL_PIDS.lock().unwrap_or_else(|e| e.into_inner());
+    if pids.is_empty() {
+        // SAFETY: registering a plain `extern "C"` function with no arguments.
+        unsafe {
+            libc::atexit(kill_launched_at_exit);
+        }
+    }
+    pids.push(pid);
+}
+
+#[allow(unsafe_code)]
+extern "C" fn kill_launched_at_exit() {
+    let pids = EXIT_KILL_PIDS.lock().unwrap_or_else(|e| e.into_inner());
+    for pid in pids.iter() {
+        // SAFETY: sending SIGKILL to a pid this process spawned; a stale pid
+        // that already exited returns ESRCH and is ignored.
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
 }

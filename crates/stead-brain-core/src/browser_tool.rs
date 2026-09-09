@@ -23,7 +23,9 @@ use steadwright::{
     UrlMatcher, WaitForFunctionOptions, WaitForOptions, WaitForSelectorState, WaitForUrlOptions,
 };
 use steadwright_cdp::transport::Incoming;
-use steadwright_cdp::{FdPairTransport, Transport, TransportError, WebSocketTransport};
+use steadwright_cdp::{
+    CdpError, Connection, FdPairTransport, Transport, TransportError, WebSocketTransport,
+};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -190,6 +192,18 @@ impl BrowserApi for Browser {
 struct BrowserConnection {
     browser: Arc<dyn BrowserApi>,
     raw: RawCdp,
+    cdp: Connection,
+}
+
+enum BrowserConnectionState {
+    Uninitialized,
+    BootstrapFailed {
+        cdp: Connection,
+        raw: RawCdp,
+        error: String,
+    },
+    Ready(Arc<BrowserConnection>),
+    Failed(String),
 }
 
 /// Process-wide connection to the browser broker. The inherited fd pair is
@@ -198,31 +212,107 @@ struct BrowserHandle;
 
 impl BrowserHandle {
     async fn get() -> Result<Arc<BrowserConnection>, String> {
-        static CONNECTION: OnceLock<Mutex<Option<Arc<BrowserConnection>>>> = OnceLock::new();
-        let slot = CONNECTION.get_or_init(|| Mutex::new(None));
+        static CONNECTION: OnceLock<Mutex<BrowserConnectionState>> = OnceLock::new();
+        let slot = CONNECTION.get_or_init(|| Mutex::new(BrowserConnectionState::Uninitialized));
         let mut guard = slot.lock().await;
-        if let Some(connection) = guard.as_ref() {
-            return Ok(connection.clone());
+        match &*guard {
+            BrowserConnectionState::Ready(connection) => {
+                if let Some(reason) = connection.cdp.closed_reason() {
+                    let error = closed_connection_error(&reason);
+                    *guard = BrowserConnectionState::Failed(error.clone());
+                    return Err(error);
+                }
+                return Ok(connection.clone());
+            }
+            BrowserConnectionState::Failed(error) => return Err(error.clone()),
+            BrowserConnectionState::BootstrapFailed { .. }
+            | BrowserConnectionState::Uninitialized => {}
         }
 
-        let connection = if inherited_stead_pipe_pair() {
-            let transport = FdPairTransport::from_raw_fds(3, 4).map_err(|_| UNAVAILABLE)?;
-            connect_routed(transport).await?
-        } else if let Ok(url) = std::env::var("STEADWRIGHT_WS_URL") {
-            if url.trim().is_empty() {
-                return Err(UNAVAILABLE.to_string());
+        let (cdp, raw) = match &*guard {
+            BrowserConnectionState::BootstrapFailed {
+                cdp, raw, error, ..
+            } => {
+                if let Some(reason) = cdp.closed_reason() {
+                    let error = closed_connection_error(&reason);
+                    *guard = BrowserConnectionState::Failed(error.clone());
+                    return Err(error);
+                }
+                tracing::info!(
+                    previous_error = %error,
+                    "retrying steadwright bootstrap on the existing browser connection"
+                );
+                (cdp.clone(), raw.clone())
             }
-            let transport = WebSocketTransport::connect(&url)
-                .await
-                .map_err(|error| format!("Browser control is unavailable: {error}"))?;
-            connect_routed(transport).await?
-        } else {
-            return Err(UNAVAILABLE.to_string());
+            BrowserConnectionState::Uninitialized => {
+                let routed = if inherited_stead_pipe_pair() {
+                    FdPairTransport::from_raw_fds(3, 4)
+                        .map(route_transport)
+                        .map_err(|_| UNAVAILABLE.to_string())
+                } else if let Ok(url) = std::env::var("STEADWRIGHT_WS_URL") {
+                    if url.trim().is_empty() {
+                        Err(UNAVAILABLE.to_string())
+                    } else {
+                        WebSocketTransport::connect(&url)
+                            .await
+                            .map(route_transport)
+                            .map_err(unavailable_error)
+                    }
+                } else {
+                    Err(UNAVAILABLE.to_string())
+                };
+                match routed {
+                    Ok(routed) => routed,
+                    Err(error) => {
+                        *guard = BrowserConnectionState::Failed(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
+            BrowserConnectionState::Ready(_) | BrowserConnectionState::Failed(_) => unreachable!(),
         };
-        let connection = Arc::new(connection);
-        *guard = Some(connection.clone());
-        Ok(connection)
+
+        match Browser::connect_connection(cdp.clone()).await {
+            Ok(browser) => {
+                let connection = Arc::new(BrowserConnection {
+                    browser: Arc::new(browser),
+                    raw,
+                    cdp,
+                });
+                *guard = BrowserConnectionState::Ready(connection.clone());
+                Ok(connection)
+            }
+            Err(error) => {
+                let message = unavailable_error(&error);
+                if let Some(reason) = cdp.closed_reason() {
+                    let message = closed_connection_error(&reason);
+                    *guard = BrowserConnectionState::Failed(message.clone());
+                    return Err(message);
+                }
+                if matches!(
+                    error,
+                    steadwright::Error::Protocol(CdpError::Protocol { .. })
+                ) {
+                    *guard = BrowserConnectionState::BootstrapFailed {
+                        cdp,
+                        raw,
+                        error: message.clone(),
+                    };
+                } else {
+                    *guard = BrowserConnectionState::Failed(message.clone());
+                }
+                Err(message)
+            }
+        }
     }
+}
+
+fn unavailable_error(error: impl std::fmt::Display) -> String {
+    format!("Browser control is unavailable: {error}")
+}
+
+fn closed_connection_error(reason: &str) -> String {
+    format!("Browser control is unavailable: the browser connection was closed ({reason})")
 }
 
 fn pipe_stat(fd: libc::c_int) -> Option<libc::stat> {
@@ -243,15 +333,9 @@ fn inherited_stead_pipe_pair() -> bool {
     read.st_dev != write.st_dev || read.st_ino != write.st_ino
 }
 
-async fn connect_routed(transport: impl Transport) -> Result<BrowserConnection, String> {
+fn route_transport(transport: impl Transport) -> (Connection, RawCdp) {
     let (transport, raw) = RoutedTransport::new(transport);
-    let browser = Browser::connect(transport)
-        .await
-        .map_err(|error| format!("Browser control is unavailable: {error}"))?;
-    Ok(BrowserConnection {
-        browser: Arc::new(browser),
-        raw,
-    })
+    (Connection::new(transport), raw)
 }
 
 #[derive(Clone)]
@@ -1747,7 +1831,8 @@ impl BrowserJsRuntime {
             attached,
             previous_context.as_ref(),
             previous_page.as_ref(),
-        );
+        )
+        .await;
         let roots = self
             .registry
             .lock()
@@ -1884,7 +1969,7 @@ impl BrowserJsRuntime {
 /// recently used page. With neither, `page` remains unresolved until its first
 /// `goto`, which creates a page in the selected/default context. Phase 6 can
 /// replace URL matching with `Stead.describeTarget` identity.
-fn select_context_page(
+async fn select_context_page(
     browser: &dyn BrowserApi,
     attached: &[TabContext],
     previous_context: Option<&BrowserContext>,
@@ -1893,12 +1978,18 @@ fn select_context_page(
     let contexts = browser.contexts();
     for tab in attached {
         for context in &contexts {
-            if let Some(page) = context
-                .pages()
-                .into_iter()
-                .find(|page| !tab.url.is_empty() && page.url() == tab.url)
-            {
-                return (context.clone(), Some(page));
+            if !tab.url.is_empty() {
+                match context.page_for_url(&tab.url).await {
+                    Ok(Some(page)) => return (context.clone(), Some(page)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            url = %tab.url,
+                            error = %error,
+                            "attached page remained unusable after initialization retry"
+                        );
+                    }
+                }
             }
         }
     }

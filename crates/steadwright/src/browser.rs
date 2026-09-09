@@ -118,10 +118,17 @@ struct TargetData {
     context_id: Option<String>,
     session_id: Option<String>,
     attached: bool,
-    initialized: bool,
+    initialization: PageInitialization,
     reported: bool,
     page: Option<Page>,
     opener_id: Option<String>,
+}
+
+#[derive(Clone)]
+enum PageInitialization {
+    Pending,
+    Ready,
+    Unusable { reason: String },
 }
 
 #[derive(Clone)]
@@ -328,7 +335,14 @@ impl std::fmt::Debug for Download {
 
 impl Browser {
     pub async fn connect(transport: impl Transport) -> Result<Self> {
-        let connection = Connection::new(transport);
+        Self::connect_connection(Connection::new(transport)).await
+    }
+
+    /// Bootstraps a browser over an existing CDP connection.
+    ///
+    /// Keeping the connection separate lets callers retain one-shot transports
+    /// (such as inherited file descriptors) when browser bootstrap is retried.
+    pub async fn connect_connection(connection: Connection) -> Result<Self> {
         let mut events = connection.events();
         let inner = Arc::new_cyclic(|weak| {
             let default = BrowserContext {
@@ -426,7 +440,13 @@ impl Browser {
                                 .and_then(|target| target.page.clone())
                         };
                         if let Some(page) = page {
-                            page.wait_ready(deadline).await?;
+                            if let Err(error) = page.wait_ready(deadline).await {
+                                tracing::warn!(
+                                    target_id = %target,
+                                    error = %error,
+                                    "ignoring unusable page during browser connection"
+                                );
+                            }
                             break;
                         }
                         wait_for_browser_event(&browser.inner).await;
@@ -478,7 +498,7 @@ impl Browser {
         }
         for target in self.inner.targets.write().unwrap().values_mut() {
             target.attached = false;
-            target.initialized = false;
+            target.initialization = PageInitialization::Pending;
         }
         self.inner.notify.notify_waiters();
         self.inner.connection.close().await;
@@ -529,12 +549,86 @@ impl BrowserContext {
                     && !target.url.starts_with("chrome-extension://")
                     && target.context_id == self.id
                     && target.attached
-                    && target.initialized
+                    && matches!(target.initialization, PageInitialization::Ready)
             })
             .filter_map(|target| target.page.as_ref())
             .filter(|page| !page.is_closed())
             .cloned()
             .collect()
+    }
+
+    /// Returns the page at `url`, retrying initialization if a prior attempt
+    /// failed while the target and its CDP session are still attached.
+    pub async fn page_for_url(&self, url: &str) -> Result<Option<Page>> {
+        let Some(browser) = self.browser.upgrade() else {
+            return Ok(None);
+        };
+        let target_id = browser
+            .targets
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, target)| {
+                target.type_ == "page"
+                    && !target.url.starts_with("chrome-extension://")
+                    && target.context_id == self.id
+                    && target.attached
+                    && target.url == url
+            })
+            .map(|(id, _)| id.clone());
+        let Some(target_id) = target_id else {
+            return Ok(None);
+        };
+
+        let deadline = Deadline::new(DEFAULT_TIMEOUT);
+        loop {
+            let retry = {
+                let mut targets = browser.targets.write().unwrap();
+                let Some(target) = targets.get_mut(&target_id) else {
+                    return Ok(None);
+                };
+                if !target.attached {
+                    return Ok(None);
+                }
+                match &target.initialization {
+                    PageInitialization::Ready => return Ok(target.page.clone()),
+                    PageInitialization::Pending => None,
+                    PageInitialization::Unusable { reason } => {
+                        tracing::info!(
+                            target_id = %target_id,
+                            previous_error = %reason,
+                            "retrying page initialization"
+                        );
+                        target.initialization = PageInitialization::Pending;
+                        target.page.as_ref().map(|page| {
+                            let mut state = page.inner.state.lock().unwrap();
+                            state.ready = false;
+                            state.initialization_error = None;
+                            (page.clone(), target.session_id.clone())
+                        })
+                    }
+                }
+            };
+
+            if let Some((page, Some(session_id))) = retry {
+                initialize_session(page.clone(), session_id, true).await?;
+                return Ok(Some(page));
+            }
+            let page = browser
+                .targets
+                .read()
+                .unwrap()
+                .get(&target_id)
+                .and_then(|target| target.page.clone());
+            if let Some(page) = page {
+                page.wait_ready(deadline).await?;
+                return Ok(Some(page));
+            }
+            if deadline.expired() {
+                return Err(Error::timeout("context.page_for_url", deadline.timeout()));
+            }
+            wait_for_browser_event(&browser).await;
+        }
     }
 
     pub async fn new_page(&self) -> Result<Page> {
@@ -2323,7 +2417,7 @@ fn update_target_info(browser: &Arc<BrowserInner>, info: &Value) -> Option<Strin
                 context_id: None,
                 session_id: None,
                 attached: false,
-                initialized: false,
+                initialization: PageInitialization::Pending,
                 reported: false,
                 page: None,
                 opener_id: None,
@@ -2338,7 +2432,7 @@ fn update_target_info(browser: &Arc<BrowserInner>, info: &Value) -> Option<Strin
         if let Some(attached) = attached {
             target.attached = attached;
             if !attached {
-                target.initialized = false;
+                target.initialization = PageInitialization::Pending;
             }
         }
     }
@@ -2409,7 +2503,7 @@ fn handle_target_detached(browser: &Arc<BrowserInner>, params: &Value) {
             if let Some(target) = browser.targets.write().unwrap().get_mut(&target_id) {
                 target.session_id = None;
                 target.attached = false;
-                target.initialized = false;
+                target.initialization = PageInitialization::Pending;
                 (target.type_.clone(), target.page.take())
             } else {
                 (String::new(), None)
@@ -2503,7 +2597,7 @@ fn handle_attached(browser: &Arc<BrowserInner>, event: &Event) {
     if let Some(target) = browser.targets.write().unwrap().get_mut(&target_id) {
         target.session_id = Some(session_id.clone());
         target.attached = true;
-        target.initialized = false;
+        target.initialization = PageInitialization::Pending;
     }
     if type_ == "page" {
         let context_id = browser
@@ -2590,7 +2684,7 @@ fn finish_page_initialization(page: &Page, result: &Result<()>) {
             let mut targets = browser.targets.write().unwrap();
             if let Some(target) = targets.get_mut(&page.inner.target_id) {
                 if target.attached {
-                    target.initialized = true;
+                    target.initialization = PageInitialization::Ready;
                     ready = true;
                     if is_user_page_target(target) && !target.reported {
                         target.reported = true;
@@ -2612,8 +2706,23 @@ fn finish_page_initialization(page: &Page, result: &Result<()>) {
             }
         }
         Err(error) => {
-            page.inner.state.lock().unwrap().initialization_error =
-                Some(format!("Failed to initialize page: {error}"));
+            let reason = format!("Failed to initialize page: {error}");
+            if let Some(target) = browser
+                .targets
+                .write()
+                .unwrap()
+                .get_mut(&page.inner.target_id)
+            {
+                target.initialization = PageInitialization::Unusable {
+                    reason: reason.clone(),
+                };
+            }
+            page.inner.state.lock().unwrap().initialization_error = Some(reason.clone());
+            tracing::warn!(
+                target_id = %page.inner.target_id,
+                error = %reason,
+                "page initialization failed; target will remain unusable until retried"
+            );
         }
     }
 
@@ -3316,7 +3425,9 @@ fn handle_download_begin(browser: &Arc<BrowserInner>, params: &Value) {
         .read()
         .unwrap()
         .values()
-        .filter(|target| target.attached && target.initialized)
+        .filter(|target| {
+            target.attached && matches!(target.initialization, PageInitialization::Ready)
+        })
         .filter_map(|target| target.page.as_ref())
         .find(|page| {
             page.inner

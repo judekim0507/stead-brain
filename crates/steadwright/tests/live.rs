@@ -1,13 +1,156 @@
 mod support;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use steadwright::{
-    ClickOptions, GotoOptions, JsValue, LoadState, MouseButton, ScreenshotFormat,
+    Browser, ClickOptions, GotoOptions, JsValue, LoadState, MouseButton, ScreenshotFormat,
     ScreenshotOptions, UrlMatcher, ViewportSize, WaitForUrlOptions,
 };
+use steadwright_cdp::transport::Incoming;
+use steadwright_cdp::{Transport, TransportError};
 use support::Fixture;
+use tokio::sync::mpsc;
+
+struct FakeBrowserTransport {
+    incoming: Option<Incoming>,
+    responses: mpsc::Sender<Result<String, TransportError>>,
+    sent_attachments: AtomicBool,
+}
+
+impl FakeBrowserTransport {
+    async fn emit(&self, message: Value) -> Result<(), TransportError> {
+        self.responses
+            .send(Ok(message.to_string()))
+            .await
+            .map_err(|_| TransportError::Closed)
+    }
+}
+
+#[async_trait]
+impl Transport for FakeBrowserTransport {
+    async fn send(&self, message: String) -> Result<(), TransportError> {
+        let command: Value = serde_json::from_str(&message)
+            .map_err(|error| TransportError::InvalidMessage(error.to_string()))?;
+        let id = command["id"].clone();
+        let method = command["method"].as_str().unwrap_or_default();
+        let session = command.get("sessionId").and_then(Value::as_str);
+        let result = match method {
+            "Target.getTargets" => json!({
+                "targetInfos": [
+                    {"targetId":"denied","type":"page","url":"https://denied.example/","attached":true},
+                    {"targetId":"usable","type":"page","url":"https://usable.example/","attached":true}
+                ]
+            }),
+            "Page.getFrameTree" => {
+                let frame_id = if session == Some("denied-session") {
+                    "denied-frame"
+                } else {
+                    "usable-frame"
+                };
+                json!({"frameTree":{"frame":{"id":frame_id,"url":format!("https://{}.example/", if frame_id == "denied-frame" { "denied" } else { "usable" }),"name":"","loaderId":"loader"}}})
+            }
+            _ => json!({}),
+        };
+        self.emit(json!({"id":id,"result":result})).await?;
+
+        if method == "Target.setAutoAttach"
+            && session.is_none()
+            && !self.sent_attachments.swap(true, Ordering::SeqCst)
+        {
+            for (target_id, session_id, url) in [
+                ("denied", "denied-session", "https://denied.example/"),
+                ("usable", "usable-session", "https://usable.example/"),
+            ] {
+                self.emit(json!({
+                    "method":"Target.attachedToTarget",
+                    "params":{
+                        "sessionId":session_id,
+                        "targetInfo":{"targetId":target_id,"type":"page","url":url,"attached":true},
+                        "waitingForDebugger":true
+                    }
+                }))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn incoming(&mut self) -> Incoming {
+        self.incoming.take().unwrap()
+    }
+
+    async fn close(&self) {}
+}
+
+struct RejectFrameTreeTransport<T> {
+    inner: T,
+    responses: mpsc::Sender<Result<String, TransportError>>,
+    rejected: AtomicBool,
+}
+
+#[async_trait]
+impl<T: Transport + Sync> Transport for RejectFrameTreeTransport<T> {
+    async fn send(&self, message: String) -> Result<(), TransportError> {
+        let command: Value = serde_json::from_str(&message)
+            .map_err(|error| TransportError::InvalidMessage(error.to_string()))?;
+        if command["method"] == "Page.getFrameTree"
+            && command.get("sessionId").and_then(Value::as_str) == Some("denied-session")
+            && !self.rejected.swap(true, Ordering::SeqCst)
+        {
+            return self
+                .responses
+                .send(Ok(json!({
+                    "id":command["id"],
+                    "error":{"code":-32000,"message":"stead: policy denied command"}
+                })
+                .to_string()))
+                .await
+                .map_err(|_| TransportError::Closed);
+        }
+        self.inner.send(message).await
+    }
+
+    fn incoming(&mut self) -> Incoming {
+        self.inner.incoming()
+    }
+
+    async fn close(&self) {
+        self.inner.close().await;
+    }
+}
+
+#[tokio::test]
+async fn connect_ignores_one_page_initialization_protocol_error() {
+    let (responses, incoming) = mpsc::channel(128);
+    let transport = RejectFrameTreeTransport {
+        responses: responses.clone(),
+        rejected: AtomicBool::new(false),
+        inner: FakeBrowserTransport {
+            incoming: Some(incoming),
+            responses,
+            sent_attachments: AtomicBool::new(false),
+        },
+    };
+
+    let browser = Browser::connect(transport)
+        .await
+        .expect("one denied target must not make the browser connection fail");
+    let pages = browser.default_context().pages();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].url(), "https://usable.example/");
+
+    let retried = browser
+        .default_context()
+        .page_for_url("https://denied.example/")
+        .await
+        .expect("a later URL lookup should retry page initialization")
+        .expect("the denied target should still be attached");
+    assert_eq!(retried.url(), "https://denied.example/");
+    assert_eq!(browser.default_context().pages().len(), 2);
+}
 
 fn null() -> Value {
     Value::Null
