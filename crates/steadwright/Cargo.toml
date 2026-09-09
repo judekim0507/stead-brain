@@ -1,0 +1,20 @@
+[package]
+name = "steadwright"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Playwright-compatible browser control over CDP, driven by Playwright's injected script. No Node."
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+steadwright-cdp = { path = "../steadwright-cdp" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

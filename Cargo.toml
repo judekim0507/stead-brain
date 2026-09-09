@@ -4,6 +4,8 @@ members = [
   "crates/stead-brain",
   "crates/stead-brain-core",
   "crates/stead-brain-protocol",
+  "crates/steadwright",
+  "crates/steadwright-cdp",
 ]
 
 [workspace.package]

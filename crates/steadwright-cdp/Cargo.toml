@@ -1,0 +1,18 @@
+[package]
+name = "steadwright-cdp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-agnostic Chrome DevTools Protocol client (fd-pair and WebSocket transports)."
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tempfile.workspace = true
