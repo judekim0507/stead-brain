@@ -7,15 +7,15 @@ Use this skill for GitHub web workflows when logged-in browser state matters.
 
 Perception order:
 
-1. Use `await page.snapshot()` inside `browser_exec` to identify repo navigation, issue/PR titles, tabs, form fields, and action buttons.
+1. Use `await page.ariaSnapshot()` inside `browser_exec` to identify repo navigation, issue/PR titles, tabs, form fields, and action buttons.
 2. Use `await page.goto(url)` for direct GitHub URLs when the target URL is known.
 3. Prefer `page.getByRole`, `getByText`, and `getByLabel`; use `page.evaluate` only for targeted inspection when a custom control is genuinely ambiguous.
 4. Use `await page.screenshot()` only for visual diffs, diagrams, or layout-specific review.
 
 Common flows:
 
-- Inspect issue/PR: navigate or click to the page, snapshot title/state/labels, then summarize only verified page content.
-- Comment: find the textarea/editor with a semantic locator, fill or focus+type, then re-snapshot the preview/textarea before submitting.
+- Inspect issue/PR: navigate or click to the page, inspect the ARIA snapshot for title/state/labels, then summarize only verified page content.
+- Comment: find the textarea/editor with a semantic locator, fill or focus+type, then take a new ARIA snapshot of the preview/textarea before submitting.
 - Review PR: inspect changed files and comments one file at a time. Avoid broad screenshots unless code layout is visually relevant.
 - Manage labels/assignees/milestones: use semantic controls, verify selected options, then apply.
 

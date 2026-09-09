@@ -30,6 +30,29 @@ async fn main() {
         .unwrap(),
         Err(e) => writeln!(log, "getTargets err: {e}").unwrap(),
     }
+    match conn.send("Stead.listTabs", json!({}), None).await {
+        Ok(v) => writeln!(log, "listTabs ok: {v}").unwrap(),
+        Err(e) => writeln!(log, "listTabs err: {e}").unwrap(),
+    }
+    if let Ok(v) = conn.send("Target.getTargets", json!({}), None).await {
+        if let Some(t) = v["targetInfos"]
+            .as_array()
+            .and_then(|a| a.iter().find(|t| t["type"] == "page"))
+        {
+            let id = t["targetId"].clone();
+            match conn
+                .send("Stead.describeTarget", json!({"targetId": id}), None)
+                .await
+            {
+                Ok(v) => writeln!(log, "describeTarget ok: {v}").unwrap(),
+                Err(e) => writeln!(log, "describeTarget err: {e}").unwrap(),
+            }
+        }
+    }
+    match conn.send("Stead.nope", json!({}), None).await {
+        Ok(v) => writeln!(log, "unknown ok?: {v}").unwrap(),
+        Err(e) => writeln!(log, "unknown err (expected): {e}").unwrap(),
+    }
     log.flush().unwrap();
     // Keep the stdio protocol alive so the browser does not restart us.
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

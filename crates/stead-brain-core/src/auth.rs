@@ -523,11 +523,11 @@ impl AuthStorage {
 
         #[cfg(target_os = "macos")]
         {
-            return Self::Keychain {
+            Self::Keychain {
                 service: KEYCHAIN_SERVICE.to_string(),
                 account: keychain_account_for_agent_root(agent_root),
                 legacy_path,
-            };
+            }
         }
 
         #[cfg(not(target_os = "macos"))]
