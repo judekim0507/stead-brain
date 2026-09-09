@@ -293,3 +293,30 @@ Entry points steadwright uses (method names on the InjectedScript instance):
   so `page.evaluate` supports Date/RegExp/Map/Set/BigInt/undefined round trips.
 
 Not used: `expectArray`, recorder/console APIs, user overlays, screencast.
+
+## Status — 2026-09-09
+
+All phases landed on branch `steadwright` (stead-brain and stead-macos).
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | 375 passed (steadwright 50 live, steadwright-cdp 5, brain-core 56, vendored pie 257) |
+| steadwright live suite wall time | ~18 s |
+| Chromium `stead_agent_control_service.cc` | 6,977 → 1,468 lines |
+| brain `lib.rs` | 6,839 → 5,296 lines; `browser_repl.rs` (6,237) deleted |
+| `stead-brain` release binary | 10.1 MB → 11.7 MB |
+| end to end (headed Stead, Codex GPT-5.6-Sol) | "open example.com, title?" → 1 `browser_exec`, 5 s |
+| Apple configurator, cold chat, Sol Medium | 3 `browser_exec` calls, 23 s to a correct stop: Apple's store was in "Be right back" maintenance (event day), so the configurator itself is unverified. Re-run when the store is up. Baseline was 50 calls / 315 s. |
+
+Browser instruction in the prompt is now two bullets plus the safety and
+credential rules; the browser-automation skill is gone.
+
+Known follow-ups:
+- Chat WebUI (`chrome://chat`) does not launch the brain until interaction;
+  the new-tab page does. Pre-existing.
+- `FillTotp` returns `credential_backend_unavailable` (pre-existing).
+- CDP confirmations carry no chat session id in the audit log.
+- Two vendored `pie-ai` clippy findings under Rust 1.96 (`redundant_guards`).
+- Provider/effort selection is per browser profile; a fresh profile defaults to Claude.
+- The two branding patches at the end of `series` remain unapplied by quilt
+  (one is malformed) and need regenerating.
