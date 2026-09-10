@@ -51,7 +51,7 @@ async fn browser_exec_runs_against_chromium_and_persists_state()
             None,
         )
         .await?;
-    assert_eq!(result_value(&title), json!("Steadwright"));
+    assert_eq!(result_text(&title), "Steadwright");
     assert_eq!(
         title
             .content
@@ -71,35 +71,35 @@ async fn browser_exec_runs_against_chromium_and_persists_state()
         )
         .await?;
     assert!(
-        result_value(&snapshot)
-            .as_str()
-            .is_some_and(|value| value.contains("[ref=")),
+        result_text(&snapshot).contains("[ref="),
         "aria snapshot did not contain a Playwright ref: {:?}",
-        result_value(&snapshot)
+        result_text(&snapshot)
     );
 
     let state = tool
         .execute(
             "live-state",
-            json!({"code": "state.n = (state.n || 0) + 1; return {n: state.n, leaked: typeof globalThis.shouldNotPersist};"}),
+            json!({"code": "state.n = (state.n || 0) + 1; console.log('loaded'); console.warn('retrying'); return {n: state.n, leaked: typeof globalThis.shouldNotPersist};"}),
             CancellationToken::new(),
             None,
         )
         .await?;
-    assert_eq!(result_value(&state), json!({"n": 2, "leaked": "undefined"}));
+    assert_eq!(
+        result_text(&state),
+        "{\n \"n\": 2,\n \"leaked\": \"undefined\"\n}\n--- console ---\nloaded\nwarn: retrying"
+    );
 
     drop(chromium);
     Ok(())
 }
 
-fn result_value(result: &pie_agent_core::AgentToolResult) -> Value {
-    let text = result
+fn result_text(result: &pie_agent_core::AgentToolResult) -> &str {
+    result
         .content
         .iter()
         .find_map(|block| match block {
             pie_ai::UserContentBlock::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
-        .expect("browser_exec result must contain text");
-    serde_json::from_str::<Value>(text).expect("browser_exec text must be JSON")["result"].clone()
+        .expect("browser_exec result must contain text")
 }

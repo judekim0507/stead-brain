@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::BrowserToolBridge;
 
-const TOOL_DESCRIPTION: &str = "Run Playwright JavaScript against the user's browser. Globals: page (current tab), context, browser, state (persists across calls), console. Top-level await and return are supported. Default timeouts: actions 5s, navigation 60s.";
+const TOOL_DESCRIPTION: &str = "Run Playwright JavaScript against the user's browser, with an optional short step title shown to the user. Globals: page (current tab), context, browser, state (persists across calls), console. Top-level await and return are supported. Default timeouts: actions 5s, navigation 60s.";
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 32 * 1024;
 const MAX_LOG_BYTES: usize = 16 * 1024;
@@ -685,6 +685,7 @@ impl BrowserEventSink {
                 tool_call_id: tool_call_id.into(),
                 status: status.to_string(),
                 message: Some(message.to_string()),
+                detail: None,
             }),
         ));
     }
@@ -2098,10 +2099,11 @@ impl BrowserJsRuntime {
         };
         let log_store = logs.clone();
         let log = move |level: String, message: String| {
-            log_store
-                .lock()
-                .expect("log mutex poisoned")
-                .push(format!("{level}: {message}"));
+            let line = match level.as_str() {
+                "warn" | "error" => format!("{level}: {message}"),
+                _ => message,
+            };
+            log_store.lock().expect("log mutex poisoned").push(line);
         };
         let wrapped = format!(
             r#"(async () => {{
@@ -2109,7 +2111,9 @@ impl BrowserJsRuntime {
           globalThis.state = globalThis.__steadwrightDecode({state});
           try {{
             const value = await (async () => {{ {code} }})();
-            return JSON.stringify({{ok:true,value:globalThis.__steadwrightSerializable(value)}});
+            const result = {{ok:true}};
+            if (value !== undefined) result.value = globalThis.__steadwrightSerializable(value);
+            return JSON.stringify(result);
           }} catch (error) {{
             return JSON.stringify({{ok:false,name:String(error && error.name || 'Error'),message:String(error && error.message || error),stack:error && error.stack ? String(error.stack) : ''}});
           }}
@@ -2171,7 +2175,7 @@ impl BrowserJsRuntime {
         let omitted_images = *omitted_images.lock().expect("image mutex poisoned");
         let logs = logs.lock().expect("log mutex poisoned").clone();
         Ok(ExecutionOutcome {
-            value: parsed.get("value").cloned().unwrap_or(Value::Null),
+            value: parsed.get("value").cloned(),
             logs,
             images,
             omitted_images,
@@ -2217,7 +2221,7 @@ async fn select_context_page(
 }
 
 struct ExecutionOutcome {
-    value: Value,
+    value: Option<Value>,
     logs: Vec<String>,
     images: Vec<CapturedImage>,
     omitted_images: usize,
@@ -2283,7 +2287,13 @@ impl BrowserCodeTool {
                 description: TOOL_DESCRIPTION.into(),
                 parameters: json!({
                     "type":"object", "additionalProperties":false, "required":["code"],
-                    "properties":{"code":{"type":"string"}}
+                    "properties":{
+                        "code":{"type":"string"},
+                        "title":{
+                            "type":"string",
+                            "description":"Short present-tense label for this step, shown to the user (e.g. 'Opening the order page')."
+                        }
+                    }
                 }),
             },
             session_id,
@@ -2344,16 +2354,15 @@ impl BrowserCodeTool {
             )
             .await
             .map_err(|e| AgentToolError::Message(e.model_message()))?;
-        let result = bounded_value(outcome.value, MAX_RESULT_BYTES);
         let image_note = (outcome.omitted_images > 0).then(|| {
             format!(
                 "…[{} screenshot(s) not attached; maximum is {MAX_IMAGES}]",
                 outcome.omitted_images
             )
         });
-        let logs = bounded_logs(outcome.logs, MAX_LOG_BYTES, image_note);
-        let summary = json!({"result": result, "logs": logs});
-        let mut content = vec![pie_ai::UserContentBlock::text(summary.to_string())];
+        let output = format_output(outcome.value.as_ref(), &outcome.logs, image_note.as_deref());
+        let details = json!({"output": output.clone()});
+        let mut content = vec![pie_ai::UserContentBlock::text(output)];
         for image in outcome.images {
             content.push(pie_ai::UserContentBlock::Image(pie_ai::ImageContent {
                 data: image.data,
@@ -2362,7 +2371,7 @@ impl BrowserCodeTool {
         }
         Ok(AgentToolResult {
             content,
-            details: summary,
+            details,
             terminate: None,
         })
     }
@@ -2390,8 +2399,13 @@ impl AgentTool for BrowserCodeTool {
         cancel: CancellationToken,
         _on_update: Option<AgentToolUpdate>,
     ) -> Result<AgentToolResult, AgentToolError> {
+        let message = params
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("browser_exec")
+            .to_owned();
         if let Some(sink) = &self.event_sink {
-            sink.emit(tool_call_id, "running", "browser_exec");
+            sink.emit(tool_call_id, "running", &message);
         }
         let result = self.execute_inner(tool_call_id, params, cancel).await;
         if let Some(sink) = &self.event_sink {
@@ -2402,7 +2416,7 @@ impl AgentTool for BrowserCodeTool {
                 } else {
                     "failed"
                 },
-                "browser_exec",
+                &message,
             );
         }
         result
@@ -2661,87 +2675,117 @@ fn js_value(value: &Value) -> String {
     }
 }
 
-fn bounded_value(value: Value, limit: usize) -> Value {
-    let encoded = serde_json::to_string(&value).expect("JSON value serializes");
-    if encoded.len() <= limit {
-        return value;
+const TRUNCATION_ADVICE: &str = "return less or slice the string";
+
+fn format_output(value: Option<&Value>, logs: &[String], image_note: Option<&str>) -> String {
+    let has_result = value.is_some();
+    let has_logs = !logs.is_empty() || image_note.is_some();
+    let result = value.map_or_else(String::new, format_result_value);
+    let result = bounded_text(&result, MAX_RESULT_BYTES);
+    let logs = bounded_logs(logs, MAX_LOG_BYTES, image_note);
+
+    match (has_result, has_logs) {
+        (false, false) => "(no output)".to_string(),
+        (true, false) => result,
+        (false, true) => format!("--- console ---\n{logs}"),
+        (true, true) => format!("{result}\n--- console ---\n{logs}"),
     }
-    Value::String(fit_json_string(&encoded, limit).unwrap_or_default())
 }
 
-fn fit_json_string(source: &str, limit: usize) -> Option<String> {
+fn format_result_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        _ => compact_pretty_json(value, 0),
+    }
+}
+
+fn compact_pretty_json(value: &Value, depth: usize) -> String {
+    match value {
+        Value::Array(values) if values.iter().all(Value::is_null_or_scalar) => {
+            serde_json::to_string(value).expect("JSON value serializes")
+        }
+        Value::Array(values) => {
+            let indent = " ".repeat(depth + 1);
+            let close_indent = " ".repeat(depth);
+            let items = values
+                .iter()
+                .map(|value| format!("{indent}{}", compact_pretty_json(value, depth + 1)))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("[\n{items}\n{close_indent}]")
+        }
+        Value::Object(values) if values.is_empty() => "{}".to_string(),
+        Value::Object(values) => {
+            let indent = " ".repeat(depth + 1);
+            let close_indent = " ".repeat(depth);
+            let properties = values
+                .iter()
+                .map(|(key, value)| {
+                    let key = serde_json::to_string(key).expect("JSON key serializes");
+                    format!("{indent}{key}: {}", compact_pretty_json(value, depth + 1))
+                })
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("{{\n{properties}\n{close_indent}}}")
+        }
+        _ => serde_json::to_string(value).expect("JSON value serializes"),
+    }
+}
+
+trait JsonScalar {
+    fn is_null_or_scalar(&self) -> bool;
+}
+
+impl JsonScalar for Value {
+    fn is_null_or_scalar(&self) -> bool {
+        !matches!(self, Value::Array(_) | Value::Object(_))
+    }
+}
+
+fn bounded_text(source: &str, limit: usize) -> String {
+    if source.len() <= limit {
+        return source.to_string();
+    }
+
     let mut end = floor_char_boundary(source, limit);
     loop {
-        let value = format!(
-            "{}…[truncated {} bytes]",
-            &source[..end],
+        let marker = format!(
+            "\n… [truncated {} bytes; {TRUNCATION_ADVICE}]",
             source.len() - end
         );
-        let serialized_len = serde_json::to_string(&value)
-            .expect("string serializes")
-            .len();
-        if serialized_len <= limit {
-            return Some(value);
+        let total = end + marker.len();
+        if total <= limit {
+            return format!("{}{marker}", &source[..end]);
         }
-        if end == 0 {
-            return None;
-        }
-        end = floor_char_boundary(source, end.saturating_sub((serialized_len - limit).max(1)));
+        end = floor_char_boundary(source, end.saturating_sub((total - limit).max(1)));
     }
 }
 
-fn bounded_logs(logs: Vec<String>, limit: usize, required_note: Option<String>) -> Vec<String> {
-    let mut result = Vec::new();
-    for (index, log) in logs.iter().enumerate() {
-        let mut candidate = result.clone();
-        candidate.push(log.clone());
-        if let Some(note) = &required_note {
-            candidate.push(note.clone());
+fn bounded_logs(logs: &[String], limit: usize, required_note: Option<&str>) -> String {
+    let source = logs.join("\n");
+    let note_suffix = required_note.map_or_else(String::new, |note| {
+        if source.is_empty() {
+            note.to_string()
+        } else {
+            format!("\n{note}")
         }
-        if serde_json::to_string(&candidate)
-            .expect("logs serialize")
-            .len()
-            <= limit
-        {
-            result.push(log.clone());
-            continue;
-        }
+    });
+    if source.len() + note_suffix.len() <= limit {
+        return format!("{source}{note_suffix}");
+    }
 
-        let remainder = logs[index..].join("\n");
-        let mut end = floor_char_boundary(&remainder, limit);
-        loop {
-            let preview = format!(
-                "{}…[truncated {} bytes]",
-                &remainder[..end],
-                remainder.len() - end
-            );
-            let mut candidate = result.clone();
-            candidate.push(preview.clone());
-            if let Some(note) = &required_note {
-                candidate.push(note.clone());
-            }
-            let serialized_len = serde_json::to_string(&candidate)
-                .expect("logs serialize")
-                .len();
-            if serialized_len <= limit {
-                result.push(preview);
-                break;
-            }
-            if end == 0 {
-                break;
-            }
-            end = floor_char_boundary(
-                &remainder,
-                end.saturating_sub((serialized_len - limit).max(1)),
-            );
+    let mut end = floor_char_boundary(&source, limit.saturating_sub(note_suffix.len()));
+    loop {
+        let marker = format!(
+            "\n… [truncated {} bytes; {TRUNCATION_ADVICE}]",
+            source.len() - end
+        );
+        let total = end + note_suffix.len() + marker.len();
+        if total <= limit {
+            return format!("{}{note_suffix}{marker}", &source[..end]);
         }
-        break;
+        end = floor_char_boundary(&source, end.saturating_sub((total - limit).max(1)));
     }
-    if let Some(note) = required_note {
-        result.push(note);
-    }
-    debug_assert!(serde_json::to_string(&result).unwrap().len() <= limit);
-    result
 }
 
 fn floor_char_boundary(value: &str, mut index: usize) -> usize {
@@ -2966,6 +3010,11 @@ fn aria_options(value: Option<&Value>) -> AriaSnapshotOptions {
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok());
         options.boxes = v.get("boxes").and_then(Value::as_bool).unwrap_or(false);
+        options.interactive = v
+            .get("interactive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        options.diff = v.get("diff").and_then(Value::as_bool).unwrap_or(false);
         options.selector = v.get("selector").and_then(Value::as_str).map(str::to_owned);
         options.timeout = timeout_from(Some(v));
     }
@@ -3133,21 +3182,47 @@ mod tests {
 
     #[test]
     fn result_truncation_is_bounded_and_unicode_safe() {
-        let value = bounded_value(json!("🦀".repeat(MAX_RESULT_BYTES)), MAX_RESULT_BYTES);
-        let text = value.as_str().expect("large values become a preview");
-        assert!(serde_json::to_string(&value).unwrap().len() <= MAX_RESULT_BYTES);
-        assert!(text.contains("…[truncated "));
+        let text = bounded_text(&"🦀".repeat(MAX_RESULT_BYTES), MAX_RESULT_BYTES);
+        assert!(text.len() <= MAX_RESULT_BYTES);
+        assert!(text.lines().last().unwrap().starts_with("… [truncated "));
+        assert!(text.ends_with("bytes; return less or slice the string]"));
     }
 
     #[test]
-    fn result_truncation_accounts_for_json_escaping() {
-        let value = bounded_value(json!("\\\"".repeat(MAX_RESULT_BYTES)), MAX_RESULT_BYTES);
-        assert!(serde_json::to_string(&value).unwrap().len() <= MAX_RESULT_BYTES);
-        assert!(value.as_str().unwrap().contains("…[truncated "));
+    fn results_are_plain_text_with_compact_pretty_json_and_console_lines() {
+        assert_eq!(
+            format_output(
+                Some(&json!({"items": [1, 2, 3], "ok": true})),
+                &["loaded".into(), "warn: retrying".into()],
+                None,
+            ),
+            "{\n \"items\": [1,2,3],\n \"ok\": true\n}\n--- console ---\nloaded\nwarn: retrying"
+        );
+        assert_eq!(
+            format_output(
+                Some(&json!("- button \\\"Continue\\\" [ref=e1]\n")),
+                &[],
+                None
+            ),
+            "- button \\\"Continue\\\" [ref=e1]\n"
+        );
+        assert_eq!(format_output(None, &[], None), "(no output)");
+        assert_eq!(format_output(Some(&json!("")), &[], None), "");
     }
 
     #[test]
-    fn tool_contract_is_code_only_and_sequential() {
+    fn aria_snapshot_options_forward_interactive_diff_and_ignore_unknown_fields() {
+        let options = aria_options(Some(&json!({
+            "interactive": true,
+            "diff": true,
+            "futureOption": "ignored"
+        })));
+        assert!(options.interactive);
+        assert!(options.diff);
+    }
+
+    #[test]
+    fn tool_contract_has_optional_title_and_is_sequential() {
         let tool = BrowserCodeTool::new(
             "test-contract".into(),
             Arc::new(FakeBridge),
@@ -3156,6 +3231,10 @@ mod tests {
         );
         assert_eq!(tool.definition().description, TOOL_DESCRIPTION);
         assert_eq!(tool.definition().parameters["required"], json!(["code"]));
+        assert_eq!(
+            tool.definition().parameters["properties"]["title"]["type"],
+            "string"
+        );
         assert!(
             tool.definition().parameters["properties"]
                 .get("tab_id")
@@ -3164,39 +3243,82 @@ mod tests {
         assert_eq!(tool.execution_mode(), Some(ToolExecutionMode::Sequential));
     }
 
+    #[tokio::test]
+    async fn optional_title_labels_parent_status_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tool = BrowserCodeTool::new(
+            "test-title".into(),
+            Arc::new(FakeBridge),
+            Vec::new(),
+            Arc::new(BrowserRuntimePool::default()),
+        )
+        .with_event_sink(tx, "request-title".into());
+
+        let error = tool
+            .execute(
+                "title-call",
+                json!({"title": "Opening the order page"}),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires code"));
+
+        let statuses = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event.event {
+                BrainEvent::ToolStatus(status) => status,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ToolStatus {
+                    tool_call_id: "title-call".into(),
+                    status: "running".into(),
+                    message: Some("Opening the order page".into()),
+                    detail: None,
+                },
+                ToolStatus {
+                    tool_call_id: "title-call".into(),
+                    status: "failed".into(),
+                    message: Some("Opening the order page".into()),
+                    detail: None,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn logs_are_bounded_and_report_omitted_bytes() {
-        let logs = bounded_logs(vec!["\\\"é".repeat(MAX_LOG_BYTES)], MAX_LOG_BYTES, None);
-        assert_eq!(logs.len(), 1);
-        assert!(logs[0].contains("…[truncated "));
-        assert!(serde_json::to_string(&logs).unwrap().len() <= MAX_LOG_BYTES);
+        let logs = bounded_logs(&["\\\"é".repeat(MAX_LOG_BYTES)], MAX_LOG_BYTES, None);
+        assert!(logs.len() <= MAX_LOG_BYTES);
+        assert!(logs.lines().last().unwrap().starts_with("… [truncated "));
     }
 
     #[test]
     fn screenshot_omission_note_is_reserved_in_log_budget() {
-        let note = "…[2 screenshot(s) not attached; maximum is 4]".to_string();
-        let logs = bounded_logs(
-            vec!["x".repeat(MAX_LOG_BYTES)],
-            MAX_LOG_BYTES,
-            Some(note.clone()),
-        );
-        assert_eq!(logs.last(), Some(&note));
-        assert!(serde_json::to_string(&logs).unwrap().len() <= MAX_LOG_BYTES);
+        let note = "…[2 screenshot(s) not attached; maximum is 4]";
+        let logs = bounded_logs(&["x".repeat(MAX_LOG_BYTES)], MAX_LOG_BYTES, Some(note));
+        assert!(logs.len() <= MAX_LOG_BYTES);
+        assert!(logs.contains(note));
+        assert!(logs.lines().last().unwrap().starts_with("… [truncated "));
     }
 
     #[test]
     fn javascript_errors_include_name_message_and_first_frame() {
         let failure = JsFailure {
-            name: "TypeError".into(),
-            message: "page.foo is not a function".into(),
+            name: "Error".into(),
+            message: "locator.click: Timeout 5000ms exceeded.\nCall log:\n  - waiting for button\n  - element is not visible".into(),
             stack: Some(
-                "TypeError: page.foo is not a function\n    at <anonymous>:2\n    at ignored:3"
+                "Error: locator.click failed\n    at <anonymous>:2\n    at ignored:3"
                     .into(),
             ),
         };
         assert_eq!(
             failure.model_message(),
-            "TypeError: page.foo is not a function\nat <anonymous>:2"
+            "Error: locator.click: Timeout 5000ms exceeded.\nCall log:\n  - waiting for button\n  - element is not visible\nat <anonymous>:2"
         );
     }
 
@@ -3351,31 +3473,37 @@ mod tests {
                     tool_call_id: "parent-call".into(),
                     status: "running".into(),
                     message: Some("browser_exec".into()),
+                    detail: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:0".into(),
                     status: "running".into(),
                     message: Some("goto https://www.apple.com/ca/store".into()),
+                    detail: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:0".into(),
                     status: "completed".into(),
                     message: Some("goto https://www.apple.com/ca/store".into()),
+                    detail: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:1".into(),
                     status: "running".into(),
                     message: Some("click getByRole('button', { name: 'Go' })".into()),
+                    detail: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:1".into(),
                     status: "completed".into(),
                     message: Some("click getByRole('button', { name: 'Go' })".into()),
+                    detail: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call".into(),
                     status: "completed".into(),
                     message: Some("browser_exec".into()),
+                    detail: None,
                 },
             ]
         );

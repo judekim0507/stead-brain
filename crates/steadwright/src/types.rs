@@ -381,6 +381,8 @@ pub struct AriaSnapshotOptions {
     pub mode: AriaSnapshotMode,
     pub depth: Option<u32>,
     pub boxes: bool,
+    pub interactive: bool,
+    pub diff: bool,
     pub selector: Option<String>,
     pub timeout: Option<Duration>,
 }
@@ -391,6 +393,8 @@ impl Default for AriaSnapshotOptions {
             mode: AriaSnapshotMode::Ai,
             depth: None,
             boxes: false,
+            interactive: false,
+            diff: false,
             selector: None,
             timeout: None,
         }

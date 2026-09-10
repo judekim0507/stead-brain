@@ -473,7 +473,10 @@ async fn serve_connection(
     let fixture = fixtures.join(relative);
     match tokio::fs::read(&fixture).await {
         Ok(mut body) => {
-            if matches!(relative, "iframe-parent.html" | "nested-iframes.html") {
+            if matches!(
+                relative,
+                "iframe-parent.html" | "nested-iframes.html" | "interactive.html"
+            ) {
                 body = String::from_utf8_lossy(&body)
                     .replace("{origin_b}", origin_b)
                     .into_bytes();

@@ -1296,8 +1296,32 @@ impl Frame {
             .clone()
             .unwrap_or_else(|| "body,frameset".into());
         let deadline = self.page.deadline(options.timeout, false);
-        let json = aria_snapshot_json(self, &selector, &options, deadline).await?;
-        Ok(render_aria_snapshot_as_yaml(&json))
+        let snapshot = aria_snapshot_json(self, &selector, &options, deadline).await?;
+        let rendered = if options.interactive {
+            let (json, kept, total) = filter_interactive_snapshot(&snapshot.json);
+            let title = self.page.title().await?;
+            let header = interactive_snapshot_header(&title, &self.page.url(), kept, total);
+            let yaml = render_aria_snapshot_as_yaml(&json);
+            if yaml.is_empty() {
+                header
+            } else {
+                format!("{header}\n{yaml}")
+            }
+        } else {
+            render_aria_snapshot_as_yaml(&snapshot.json)
+        };
+        let previous = self.page.replace_aria_snapshot(
+            &snapshot.frame_id,
+            options.interactive,
+            rendered.clone(),
+        );
+        if options.diff {
+            Ok(previous
+                .map(|previous| render_snapshot_diff(&previous, &rendered))
+                .unwrap_or(rendered))
+        } else {
+            Ok(rendered)
+        }
     }
 }
 
@@ -2150,12 +2174,17 @@ fn strings(value: JsValue) -> Result<Vec<String>> {
     values.into_iter().map(string_value).collect()
 }
 
+struct AriaSnapshotJson {
+    json: Value,
+    frame_id: String,
+}
+
 async fn aria_snapshot_json(
     frame: &Frame,
     selector: &str,
     options: &AriaSnapshotOptions,
     deadline: Deadline,
-) -> Result<Value> {
+) -> Result<AriaSnapshotJson> {
     let mode = match options.mode {
         AriaSnapshotMode::Ai => "ai",
         AriaSnapshotMode::Default => "default",
@@ -2194,6 +2223,14 @@ async fn aria_snapshot_json(
         .map(str::to_owned)
         .collect();
     let depths = result.get("iframeDepths").cloned().unwrap_or_default();
+    let metadata = if options.interactive {
+        Some(
+            fetch_interactive_metadata(&resolved, result.get("json").unwrap_or(&Value::Null))
+                .await?,
+        )
+    } else {
+        None
+    };
     let mut children = Vec::with_capacity(refs.len());
     for reference in &refs {
         let child_depth = options.depth.map(|depth| {
@@ -2215,12 +2252,19 @@ async fn aria_snapshot_json(
                 deadline,
             ))
             .await
+            .map(|snapshot| snapshot.json)
             .unwrap_or_else(|_| json!([])),
         );
     }
     let mut json = result.get_mut("json").cloned().unwrap_or_else(|| json!([]));
+    if let Some(metadata) = &metadata {
+        apply_interactive_metadata(&mut json, metadata);
+    }
     merge_iframe_children(&mut json, &refs, &children);
-    Ok(json)
+    Ok(AriaSnapshotJson {
+        json,
+        frame_id: resolved.id.clone(),
+    })
 }
 
 fn merge_iframe_children(node: &mut Value, refs: &[String], children: &[Value]) {
@@ -2254,6 +2298,461 @@ fn merge_iframe_children(node: &mut Value, refs: &[String], children: &[Value]) 
     }
 }
 
+async fn fetch_interactive_metadata(frame: &Frame, snapshot: &Value) -> Result<Value> {
+    let mut refs = Vec::new();
+    collect_interactive_metadata_refs(snapshot, &mut refs);
+    if refs.is_empty() {
+        return Ok(json!({}));
+    }
+    frame
+        .call_injected(
+            World::Utility,
+            "(injected, refs) => { const result = {}; for (const ref of refs) { const element = injected.querySelector(injected.parseSelector(`aria-ref=${ref}`), injected.document, true); if (!element) continue; const tag = element.nodeName; const nativeFocusable = ['BUTTON', 'DETAILS', 'SELECT', 'TEXTAREA'].includes(tag) || ((tag === 'A' || tag === 'AREA') && element.hasAttribute('href')) || (tag === 'INPUT' && !element.hidden); const hasTabIndex = !Number.isNaN(Number(String(element.getAttribute('tabindex')))); const focusable = !element.matches(':disabled') && (nativeFocusable || hasTabIndex); const metadata = { focusable }; if ('value' in element && typeof element.value === 'string') metadata.value = [...element.value].slice(0, 60).join(''); result[ref] = metadata; } return result; }",
+            vec![json!(refs).into()],
+        )
+        .await
+}
+
+fn collect_interactive_metadata_refs(node: &Value, refs: &mut Vec<String>) {
+    if let Some(nodes) = node.as_array() {
+        for node in nodes {
+            collect_interactive_metadata_refs(node, refs);
+        }
+        return;
+    }
+    let Some(object) = node.as_object() else {
+        return;
+    };
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let needs_metadata = role == "gridcell"
+        || (matches!(role, "textbox" | "searchbox" | "combobox") && !object.contains_key("value"));
+    if needs_metadata
+        && let Some(reference) = object.get("ref").and_then(Value::as_str)
+        && !refs.iter().any(|item| item == reference)
+    {
+        refs.push(reference.to_owned());
+    }
+    if let Some(children) = object.get("children") {
+        collect_interactive_metadata_refs(children, refs);
+    }
+}
+
+fn apply_interactive_metadata(node: &mut Value, metadata: &Value) {
+    if let Some(nodes) = node.as_array_mut() {
+        for node in nodes {
+            apply_interactive_metadata(node, metadata);
+        }
+        return;
+    }
+    let Some(object) = node.as_object_mut() else {
+        return;
+    };
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let reference = object.get("ref").and_then(Value::as_str).map(str::to_owned);
+    let node_metadata = reference
+        .as_deref()
+        .and_then(|reference| metadata.get(reference));
+    if role == "gridcell" {
+        object.insert(
+            "_interactiveFocusable".into(),
+            Value::Bool(
+                node_metadata
+                    .and_then(|value| value.get("focusable"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        );
+    }
+    if matches!(role.as_str(), "textbox" | "searchbox" | "combobox") {
+        if let Some(value) = object.get("value").and_then(Value::as_str) {
+            object.insert(
+                "_interactiveValue".into(),
+                Value::String(truncate_chars(value, 60)),
+            );
+        } else if let Some(value) = node_metadata
+            .and_then(|value| value.get("value"))
+            .and_then(Value::as_str)
+        {
+            object.insert(
+                "_interactiveValue".into(),
+                Value::String(truncate_chars(value, 60)),
+            );
+        }
+    }
+    if let Some(children) = object.get_mut("children") {
+        apply_interactive_metadata(children, metadata);
+    }
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn interactive_snapshot_header(title: &str, url: &str, kept: usize, total: usize) -> String {
+    format!(
+        "# interactive snapshot: {kept} of {total} nodes; title: {}; url: {url}",
+        serde_json::to_string(title).expect("strings always serialize as JSON")
+    )
+}
+
+fn filter_interactive_snapshot(snapshot: &Value) -> (Value, usize, usize) {
+    let total = count_snapshot_nodes(snapshot);
+    let mut nodes = Vec::new();
+    if let Some(input) = snapshot.as_array() {
+        for node in input {
+            nodes.extend(
+                filter_interactive_node(node)
+                    .into_iter()
+                    .filter(Value::is_object),
+            );
+        }
+    }
+    let filtered = Value::Array(nodes);
+    let kept = count_snapshot_nodes(&filtered);
+    (filtered, kept, total)
+}
+
+fn filter_interactive_node(node: &Value) -> Vec<Value> {
+    if let Some(text) = node.as_str() {
+        return nonempty_text(text).into_iter().map(Value::String).collect();
+    }
+    let Some(object) = node.as_object() else {
+        return Vec::new();
+    };
+    if object.get("role").and_then(Value::as_str) == Some("text") {
+        return object
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(nonempty_text)
+            .into_iter()
+            .map(Value::String)
+            .collect();
+    }
+
+    let mut children = Vec::new();
+    if let Some(text) = object.get("text").and_then(Value::as_str) {
+        children.extend(nonempty_text(text).map(Value::String));
+    }
+    if let Some(raw_children) = object.get("children").and_then(Value::as_array) {
+        for child in raw_children {
+            children.extend(filter_interactive_node(child));
+        }
+    }
+
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let object_children = children.iter().filter(|child| child.is_object()).count();
+    let region_has_text = has_useful_text(node);
+    let is_region = matches!(role, "dialog" | "alertdialog" | "alert" | "status");
+    let keep = is_interactive_role(role)
+        || (role == "gridcell"
+            && object
+                .get("_interactiveFocusable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+        || (role == "img"
+            && object.get("ref").and_then(Value::as_str).is_some()
+            && object.get("cursor").and_then(Value::as_str) == Some("pointer"))
+        || (role != "img" && object.get("cursor").and_then(Value::as_str) == Some("pointer"))
+        || object.get("active").and_then(Value::as_bool) == Some(true)
+        || (role == "heading"
+            && object
+                .get("level")
+                .and_then(Value::as_u64)
+                .is_some_and(|level| (1..=3).contains(&level)))
+        || is_region
+        || (matches!(role, "form" | "navigation" | "main" | "list") && object_children >= 2)
+        || (role == "iframe" && object_children != 0);
+    if !keep {
+        return children;
+    }
+
+    let mut kept = object.clone();
+    kept.remove("_interactiveFocusable");
+    kept.remove("text");
+    kept.remove("children");
+    let has_name = kept
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.is_empty());
+    let include_text = (is_region && region_has_text)
+        || (!has_name && !matches!(role, "form" | "navigation" | "main" | "list" | "iframe"));
+    if !include_text {
+        children.retain(Value::is_object);
+    }
+    if children.len() == 1 && children[0].is_string() {
+        kept.insert("text".into(), children.remove(0));
+    } else if !children.is_empty() {
+        kept.insert("children".into(), Value::Array(children));
+    }
+    vec![Value::Object(kept)]
+}
+
+fn is_interactive_role(role: &str) -> bool {
+    matches!(
+        role,
+        "button"
+            | "link"
+            | "textbox"
+            | "searchbox"
+            | "combobox"
+            | "listbox"
+            | "option"
+            | "checkbox"
+            | "radio"
+            | "switch"
+            | "slider"
+            | "spinbutton"
+            | "menuitem"
+            | "menuitemcheckbox"
+            | "menuitemradio"
+            | "tab"
+            | "treeitem"
+    )
+}
+
+fn nonempty_text(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_owned())
+}
+
+fn has_useful_text(node: &Value) -> bool {
+    if let Some(text) = node.as_str() {
+        return !text.trim().is_empty();
+    }
+    if let Some(nodes) = node.as_array() {
+        return nodes.iter().any(has_useful_text);
+    }
+    let Some(object) = node.as_object() else {
+        return false;
+    };
+    object
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+        || object.get("children").is_some_and(has_useful_text)
+}
+
+fn count_snapshot_nodes(node: &Value) -> usize {
+    if let Some(text) = node.as_str() {
+        return usize::from(!text.trim().is_empty());
+    }
+    if let Some(nodes) = node.as_array() {
+        return nodes.iter().map(count_snapshot_nodes).sum();
+    }
+    let Some(object) = node.as_object() else {
+        return 0;
+    };
+    if object.get("role").and_then(Value::as_str) == Some("text") {
+        return usize::from(
+            object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()),
+        );
+    }
+    let own = usize::from(object.get("role").is_some());
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(|text| usize::from(!text.trim().is_empty()))
+        .unwrap_or(0);
+    own + text
+        + object
+            .get("children")
+            .map(count_snapshot_nodes)
+            .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffKind {
+    Equal,
+    Remove,
+    Add,
+}
+
+struct DiffOp<'a> {
+    kind: DiffKind,
+    line: &'a str,
+}
+
+fn render_snapshot_diff(previous: &str, current: &str) -> String {
+    if previous == current {
+        return "# no changes since previous snapshot".into();
+    }
+    let previous_lines: Vec<_> = previous.lines().collect();
+    let current_lines: Vec<_> = current.lines().collect();
+    if previous_lines.len() > 5_000 || current_lines.len() > 5_000 {
+        let note = "# diff unavailable: snapshot exceeds 5000 lines; full current snapshot follows";
+        return if current.is_empty() {
+            note.into()
+        } else {
+            format!("{note}\n{current}")
+        };
+    }
+
+    let mut operations = Vec::new();
+    lcs_diff(&previous_lines, &current_lines, &mut operations);
+    let changed = operations
+        .iter()
+        .filter(|operation| operation.kind != DiffKind::Equal)
+        .count();
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for index in operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| (operation.kind != DiffKind::Equal).then_some(index))
+    {
+        let mut start = index;
+        let mut context = 0;
+        while start != 0 && context != 2 && operations[start - 1].kind == DiffKind::Equal {
+            start -= 1;
+            context += 1;
+        }
+        let mut end = index + 1;
+        context = 0;
+        while end < operations.len() && context != 2 && operations[end].kind == DiffKind::Equal {
+            end += 1;
+            context += 1;
+        }
+        if let Some(last) = ranges.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            ranges.push((start, end));
+        }
+    }
+
+    let mut output = vec![format!(
+        "# diff vs previous snapshot ({changed} lines changed); use aria-ref=eN from either side"
+    )];
+    for (start, end) in ranges {
+        let old_before = operations[..start]
+            .iter()
+            .filter(|operation| operation.kind != DiffKind::Add)
+            .count();
+        let new_before = operations[..start]
+            .iter()
+            .filter(|operation| operation.kind != DiffKind::Remove)
+            .count();
+        let old_count = operations[start..end]
+            .iter()
+            .filter(|operation| operation.kind != DiffKind::Add)
+            .count();
+        let new_count = operations[start..end]
+            .iter()
+            .filter(|operation| operation.kind != DiffKind::Remove)
+            .count();
+        let old_start = if old_count == 0 {
+            old_before
+        } else {
+            old_before + 1
+        };
+        let new_start = if new_count == 0 {
+            new_before
+        } else {
+            new_before + 1
+        };
+        output.push(format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+        ));
+        output.extend(operations[start..end].iter().map(|operation| {
+            let prefix = match operation.kind {
+                DiffKind::Equal => ' ',
+                DiffKind::Remove => '-',
+                DiffKind::Add => '+',
+            };
+            format!("{prefix}{}", operation.line)
+        }));
+    }
+    output.join("\n")
+}
+
+fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str], output: &mut Vec<DiffOp<'a>>) {
+    if old.is_empty() {
+        output.extend(new.iter().map(|line| DiffOp {
+            kind: DiffKind::Add,
+            line,
+        }));
+        return;
+    }
+    if new.is_empty() {
+        output.extend(old.iter().map(|line| DiffOp {
+            kind: DiffKind::Remove,
+            line,
+        }));
+        return;
+    }
+    if old.len() == 1 {
+        if let Some(index) = new.iter().position(|line| *line == old[0]) {
+            output.extend(new[..index].iter().map(|line| DiffOp {
+                kind: DiffKind::Add,
+                line,
+            }));
+            output.push(DiffOp {
+                kind: DiffKind::Equal,
+                line: old[0],
+            });
+            output.extend(new[index + 1..].iter().map(|line| DiffOp {
+                kind: DiffKind::Add,
+                line,
+            }));
+        } else {
+            output.push(DiffOp {
+                kind: DiffKind::Remove,
+                line: old[0],
+            });
+            output.extend(new.iter().map(|line| DiffOp {
+                kind: DiffKind::Add,
+                line,
+            }));
+        }
+        return;
+    }
+
+    let middle = old.len() / 2;
+    let left = lcs_lengths(&old[..middle], new);
+    let reversed_old: Vec<_> = old[middle..].iter().rev().copied().collect();
+    let reversed_new: Vec<_> = new.iter().rev().copied().collect();
+    let right = lcs_lengths(&reversed_old, &reversed_new);
+    let mut split = 0;
+    let mut best = 0;
+    for index in 0..=new.len() {
+        let length = left[index] + right[new.len() - index];
+        if length > best {
+            best = length;
+            split = index;
+        }
+    }
+    lcs_diff(&old[..middle], &new[..split], output);
+    lcs_diff(&old[middle..], &new[split..], output);
+}
+
+fn lcs_lengths(old: &[&str], new: &[&str]) -> Vec<usize> {
+    let mut previous = vec![0; new.len() + 1];
+    for old_line in old {
+        let mut current = vec![0; new.len() + 1];
+        for (index, new_line) in new.iter().enumerate() {
+            current[index + 1] = if old_line == new_line {
+                previous[index] + 1
+            } else {
+                current[index].max(previous[index + 1])
+            };
+        }
+        previous = current;
+    }
+    previous
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2766,114 @@ mod tests {
         assert_eq!(
             split_selector_by_frame("internal:text=\">> internal:control=enter-frame\"i").unwrap(),
             ["internal:text=\">> internal:control=enter-frame\"i"]
+        );
+    }
+
+    #[test]
+    fn interactive_filter_collapses_structure_and_counts_aria_and_text_nodes() {
+        let snapshot = json!([
+            {"role":"paragraph","children":[{"role":"text","text":"discarded article copy"}]},
+            {"role":"button","name":"Save","ref":"e1","children":["Save"]},
+            {"role":"generic","children":[{"role":"link","name":"Docs","ref":"e2"}]},
+            {"role":"status","children":[{"role":"paragraph","children":["Upload complete"]}]},
+            {"role":"gridcell","name":"Editable","ref":"e3","_interactiveFocusable":true},
+            {"role":"gridcell","name":"Static","ref":"e4","_interactiveFocusable":false}
+        ]);
+        let (filtered, kept, total) = filter_interactive_snapshot(&snapshot);
+        assert_eq!(
+            total, 11,
+            "objects and their rendered text leaves count as nodes"
+        );
+        assert_eq!(
+            kept, 5,
+            "kept nodes include useful text retained by a region"
+        );
+        assert_eq!(
+            render_aria_snapshot_as_yaml(&filtered),
+            "- button \"Save\" [ref=e1]\n- link \"Docs\" [ref=e2]\n- status: Upload complete\n- gridcell \"Editable\" [ref=e3]"
+        );
+    }
+
+    #[test]
+    fn interactive_metadata_adds_truncated_values_and_gridcell_focusability() {
+        let mut snapshot = json!([
+            {"role":"textbox","name":"Query","text":"old child value","ref":"e1"},
+            {"role":"combobox","name":"Kind","ref":"e2"},
+            {"role":"gridcell","name":"Focusable","ref":"e3"},
+            {"role":"gridcell","name":"Static","ref":"e4"}
+        ]);
+        let long_value = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        apply_interactive_metadata(
+            &mut snapshot,
+            &json!({
+                "e1":{"focusable":true,"value":long_value},
+                "e2":{"focusable":true,"value":"second"},
+                "e3":{"focusable":true},
+                "e4":{"focusable":false}
+            }),
+        );
+        let (filtered, _, _) = filter_interactive_snapshot(&snapshot);
+        let rendered = render_aria_snapshot_as_yaml(&filtered);
+        assert!(rendered.contains(&format!(
+            "[value={}]",
+            serde_json::to_string(&long_value.chars().take(60).collect::<String>()).unwrap()
+        )));
+        assert!(rendered.contains("combobox \"Kind\" [value=\"second\"]"));
+        assert!(!rendered.contains("old child value"));
+        assert!(rendered.contains("gridcell \"Focusable\""));
+        assert!(!rendered.contains("gridcell \"Static\""));
+    }
+
+    #[test]
+    fn interactive_filter_keeps_exact_region_roles_and_unnamed_control_text() {
+        let snapshot = json!([
+            {"role":"dialog","name":"Information","children":[{"role":"paragraph","children":["Dialog details"]}]},
+            {"role":"region","name":"Generic region","children":["Discarded region copy"]},
+            {"role":"textbox","_interactiveValue":"typed","children":["Visible fallback"],"ref":"e1"}
+        ]);
+        let (filtered, _, _) = filter_interactive_snapshot(&snapshot);
+        assert_eq!(
+            render_aria_snapshot_as_yaml(&filtered),
+            "- dialog \"Information\": Dialog details\n- textbox [value=\"typed\"] [ref=e1]: Visible fallback"
+        );
+    }
+
+    #[test]
+    fn interactive_header_escapes_title_quotes_backslashes_and_controls() {
+        assert_eq!(
+            interactive_snapshot_header(
+                "A \"quoted\" \\ title\nnext",
+                "https://example.test/path",
+                4,
+                10
+            ),
+            "# interactive snapshot: 4 of 10 nodes; title: \"A \\\"quoted\\\" \\\\ title\\nnext\"; url: https://example.test/path"
+        );
+    }
+
+    #[test]
+    fn snapshot_diff_uses_two_context_lines_and_counts_additions_and_removals() {
+        let previous = "zero\none\nold [ref=e1]\nthree\nfour\nfive";
+        let current = "zero\none\nnew [ref=e2]\nthree\nfour\nfive";
+        assert_eq!(
+            render_snapshot_diff(previous, current),
+            "# diff vs previous snapshot (2 lines changed); use aria-ref=eN from either side\n@@ -1,5 +1,5 @@\n zero\n one\n-old [ref=e1]\n+new [ref=e2]\n three\n four"
+        );
+        assert_eq!(
+            render_snapshot_diff(current, current),
+            "# no changes since previous snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_diff_falls_back_for_large_inputs() {
+        let previous = std::iter::repeat_n("old", 5_001)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = "current";
+        assert_eq!(
+            render_snapshot_diff(&previous, current),
+            "# diff unavailable: snapshot exceeds 5000 lines; full current snapshot follows\ncurrent"
         );
     }
 }

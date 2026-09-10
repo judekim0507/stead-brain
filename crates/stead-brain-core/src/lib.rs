@@ -100,7 +100,7 @@ const STEAD_SYSTEM_PROMPT: &str = r#"You are Stead, a browser-native agent built
 Your job is to help the user by using native browser perception and action tools carefully, efficiently, and safely.
 
 Browser operating rules:
-- Browser control: `browser_exec` runs Playwright JavaScript. `page` is the current tab; `getByRole`, `getByText`, `getByLabel`, `locator`, and the rest of the Playwright API work exactly as in Playwright, with a 5-second default action timeout. Write the whole task as one script with loops and conditionals rather than one action per call. Call `await page.ariaSnapshot()` only when you need to look; keep it in a variable and search it in JavaScript instead of logging it, then act with `page.locator('aria-ref=e12')` or a role/name locator. Only `state` persists between executions. If `browser_exec` reports that browser control is unavailable, tell the user instead of substituting `WebFetch`.
+- Browser control: `browser_exec` runs Playwright JavaScript. `page` is the current tab; `getByRole`, `getByText`, `getByLabel`, `locator`, and the rest of the Playwright API work exactly as in Playwright, with a 5-second default action timeout. Write the whole task as one script with loops and conditionals rather than one action per call. Look with `await page.ariaSnapshot({interactive: true})` (interactive elements only, ~70% smaller) and `{interactive: true, diff: true}` after an action to see only what changed; call the plain `ariaSnapshot()` only when you need static text. Only `state` persists between executions. If `browser_exec` reports that browser control is unavailable, tell the user instead of substituting `WebFetch`.
 - Verify outcomes from page state (URL, text, a confirmation) before reporting success. Do not activate purchases, sends, or other irreversible actions unless the user asked for them.
 - Do not ask the user for passwords, TOTP codes, cookies, or payment secrets. Use brokered credential tools or report that the credential backend is unavailable.
 - Use saved browser passwords only through `stead.credentials.list()`, `stead.credentials.fill(credential, usernameLocator, passwordLocator)`, and `stead.credentials.fillTotp(credential, fieldLocator)` inside `browser_exec`. Never type, print, summarize, store, or ask for a password/TOTP value.
@@ -815,6 +815,7 @@ impl AgentTool for AskUserTool {
                     tool_call_id: tool_call_id.to_string(),
                     status: "waiting_for_user".to_string(),
                     message: Some(prompt.to_string()),
+                    detail: None,
                 }),
             ),
         );
@@ -1498,6 +1499,7 @@ impl BrainCore {
                             tool_call_id: "turn".to_string(),
                             status: "cancelled".to_string(),
                             message: None,
+                            detail: None,
                         }),
                     ),
                 );
@@ -1602,6 +1604,7 @@ impl BrainCore {
                     tool_call_id: result.tool_call_id,
                     status: if ok { "completed" } else { "failed" }.to_string(),
                     message: error,
+                    detail: None,
                 }),
             )]);
         }
@@ -1635,6 +1638,7 @@ impl BrainCore {
                 }
                 .to_string(),
                 message: result.result.error,
+                detail: None,
             }),
         )])
     }
@@ -1665,6 +1669,7 @@ impl BrainCore {
                 tool_call_id: "turn".to_string(),
                 status: status.to_string(),
                 message,
+                detail: None,
             }),
         )])
     }
@@ -2112,8 +2117,23 @@ fn turn_event_listener(
                 AgentEvent::ToolExecutionStart {
                     tool_call_id,
                     tool_name,
-                    ..
+                    args,
                 } => {
+                    // browser_exec: the model's step title (if any) becomes the
+                    // message and the script travels as detail so the UI can
+                    // show the code card while it runs.
+                    let (message, detail) = if tool_name == "browser_exec" {
+                        let title = args
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|title| !title.is_empty())
+                            .map(str::to_owned);
+                        let code = args.get("code").and_then(Value::as_str).map(str::to_owned);
+                        (title.or(Some(tool_name)), code)
+                    } else {
+                        (Some(tool_name), None)
+                    };
                     emit_response(
                         &tx,
                         ResponseEnvelope::session_event(
@@ -2122,7 +2142,8 @@ fn turn_event_listener(
                             BrainEvent::ToolStatus(ToolStatus {
                                 tool_call_id,
                                 status: "running".to_string(),
-                                message: Some(tool_name),
+                                message,
+                                detail,
                             }),
                         ),
                     );
@@ -2130,9 +2151,17 @@ fn turn_event_listener(
                 AgentEvent::ToolExecutionEnd {
                     tool_call_id,
                     tool_name,
+                    result,
                     is_error,
-                    ..
                 } => {
+                    let detail = (tool_name == "browser_exec").then(|| {
+                        let text = user_blocks_to_text(&result.content);
+                        let mut preview: String = text.chars().take(1200).collect();
+                        if preview.chars().count() < text.chars().count() {
+                            preview.push_str("\n…");
+                        }
+                        preview
+                    });
                     emit_response(
                         &tx,
                         ResponseEnvelope::session_event(
@@ -2142,6 +2171,7 @@ fn turn_event_listener(
                                 tool_call_id,
                                 status: if is_error { "failed" } else { "completed" }.to_string(),
                                 message: Some(tool_name),
+                                detail,
                             }),
                         ),
                     );

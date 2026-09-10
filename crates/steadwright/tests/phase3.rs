@@ -524,6 +524,169 @@ async fn single_frame_aria_renderer_matches_injected_recorder_golden() {
 }
 
 #[tokio::test]
+async fn interactive_aria_snapshot_is_compact_stable_and_cross_origin() {
+    let Some(fixture) = Fixture::get().await else {
+        return;
+    };
+    let page = fixture.new_page().await.unwrap();
+    let url = fixture.url_a("/interactive.html");
+    page.goto(&url, GotoOptions::default()).await.unwrap();
+
+    let full = page
+        .aria_snapshot(AriaSnapshotOptions::default())
+        .await
+        .unwrap();
+    let interactive_options = AriaSnapshotOptions {
+        interactive: true,
+        ..Default::default()
+    };
+    let interactive = page
+        .aria_snapshot(interactive_options.clone())
+        .await
+        .unwrap();
+    let ratio = interactive.len() as f64 / full.len() as f64;
+    println!(
+        "interactive snapshot size ratio: {:.2}% ({}/{} bytes)",
+        ratio * 100.0,
+        interactive.len(),
+        full.len()
+    );
+    assert!(
+        interactive.len() * 100 < full.len() * 35,
+        "interactive snapshot was {:.2}% of full snapshot",
+        ratio * 100.0
+    );
+
+    let header = interactive.lines().next().unwrap();
+    assert_eq!(
+        header,
+        format!(
+            "# interactive snapshot: 56 of 152 nodes; title: \"Interactive snapshot\"; url: {url}"
+        )
+    );
+
+    assert!(interactive.contains("heading \"Interactive fixture\" [level=1]"));
+    for index in 1..=30 {
+        let line = interactive
+            .lines()
+            .find(|line| line.contains(&format!("link \"Navigation link {index}\"")))
+            .unwrap_or_else(|| panic!("navigation link {index} missing"));
+        assert!(line.contains("[ref="), "navigation link {index} had no ref");
+    }
+    assert!(interactive.contains("textbox \"First name\" [value=\"A populated value\"]"));
+    assert!(interactive.contains(
+        "textbox \"Biography\" [value=\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567\"]"
+    ));
+    assert!(interactive.contains("combobox \"Country\" [value=\"jp\"]"));
+    assert!(interactive.contains("listbox \"Topics\""));
+    for option in ["Canada", "Japan", "New Zealand", "Rust", "Web", "Testing"] {
+        let line = interactive
+            .lines()
+            .find(|line| line.contains(&format!("option \"{option}\"")))
+            .unwrap_or_else(|| panic!("option {option} missing"));
+        assert!(
+            line.contains("[ref="),
+            "option {option} had no ARIA ref: {line}\n{interactive}"
+        );
+    }
+    for role_and_name in [
+        ("textbox", "First name"),
+        ("textbox", "Biography"),
+        ("combobox", "Country"),
+        ("listbox", "Topics"),
+        ("radio", "Slow"),
+        ("radio", "Medium"),
+        ("radio", "Fast"),
+        ("button", "Unavailable action"),
+        ("button", "Dismiss dialog"),
+        ("link", "Read dialog help"),
+    ] {
+        let line = interactive
+            .lines()
+            .find(|line| line.contains(&format!("{} \"{}\"", role_and_name.0, role_and_name.1)))
+            .unwrap_or_else(|| panic!("{} {} missing", role_and_name.0, role_and_name.1));
+        assert!(
+            line.contains("[ref="),
+            "{} {} had no ref",
+            role_and_name.0,
+            role_and_name.1
+        );
+    }
+    assert!(interactive.contains("button \"Unavailable action\" [disabled]"));
+    assert!(!interactive.lines().any(|line| line.contains("- paragraph")));
+    assert!(!interactive.contains("Article paragraph 01"));
+    let pointer_line = interactive
+        .lines()
+        .find(|line| line.contains("Pointer-only action"))
+        .unwrap();
+    assert!(pointer_line.contains("generic"));
+    assert!(pointer_line.contains("[cursor=pointer]"));
+    assert!(interactive.contains("dialog \"Help dialog\""));
+    let frame_button = interactive
+        .lines()
+        .find(|line| line.contains("button \"Cross-origin action\""))
+        .unwrap();
+    assert!(frame_button.contains("[ref=f"));
+    assert!(frame_button.contains('e'));
+
+    let refs = |snapshot: &str| {
+        snapshot
+            .split("[ref=")
+            .skip(1)
+            .filter_map(|part| part.split(']').next())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let second = page
+        .aria_snapshot(interactive_options.clone())
+        .await
+        .unwrap();
+    assert_eq!(refs(&interactive), refs(&second));
+
+    page.get_by_role(
+        "radio",
+        ByRoleOptions {
+            name: Some(TextMatch::from("Medium")),
+            ..Default::default()
+        },
+    )
+    .click(ActionOptions::default())
+    .await
+    .unwrap();
+    let diff_options = AriaSnapshotOptions {
+        interactive: true,
+        diff: true,
+        ..Default::default()
+    };
+    let diff = page.aria_snapshot(diff_options.clone()).await.unwrap();
+    assert!(diff.starts_with(
+        "# diff vs previous snapshot (4 lines changed); use aria-ref=eN from either side\n@@ "
+    ));
+    assert!(
+        diff.lines()
+            .any(|line| { line.starts_with('-') && line.contains("radio \"Slow\" [checked]") })
+    );
+    assert!(
+        diff.lines()
+            .any(|line| { line.starts_with('+') && line.contains("radio \"Medium\" [checked]") })
+    );
+    assert!(diff.lines().count() < 12, "diff was too large:\n{diff}");
+    assert_eq!(
+        page.aria_snapshot(diff_options.clone()).await.unwrap(),
+        "# no changes since previous snapshot"
+    );
+
+    page.goto(&fixture.url_a("/index.html"), GotoOptions::default())
+        .await
+        .unwrap();
+    let after_navigation = page.aria_snapshot(diff_options).await.unwrap();
+    assert!(after_navigation.starts_with("# interactive snapshot:"));
+    assert!(!after_navigation.starts_with("# diff vs previous snapshot"));
+    assert!(after_navigation.contains("button \"before click\""));
+    page.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn wait_for_event_registers_dialog_and_popup_before_actions() {
     let Some(fixture) = Fixture::get().await else {
         return;

@@ -90,6 +90,11 @@ fn create_key(node: &Value) -> String {
             key.push_str(&serde_json::to_string(name).expect("strings always serialize as JSON"));
         }
     }
+    if let Some(value) = object.get("_interactiveValue").and_then(Value::as_str) {
+        key.push_str(" [value=");
+        key.push_str(&serde_json::to_string(value).expect("strings always serialize as JSON"));
+        key.push(']');
+    }
     if object.get("checked").and_then(Value::as_str) == Some("mixed") {
         key.push_str(" [checked=mixed]");
     } else if truthy(object.get("checked")) {
@@ -265,6 +270,29 @@ mod tests {
   - text: ignored
 - paragraph:
   - text: "hello: world""#
+        );
+    }
+
+    #[test]
+    fn renders_interactive_values_in_the_node_key() {
+        let snapshot = json!([
+            {"role":"textbox","name":"Search","_interactiveValue":"quoted \"value\"","ref":"e1"},
+            {"role":"combobox","name":"Size","_interactiveValue":"large","expanded":true,"ref":"e2"}
+        ]);
+        assert_eq!(
+            render_aria_snapshot_as_yaml(&snapshot),
+            "- textbox \"Search\" [value=\"quoted \\\"value\\\"\"] [ref=e1]\n- combobox \"Size\" [value=\"large\"] [expanded] [ref=e2]"
+        );
+    }
+
+    #[test]
+    fn ignores_raw_values_to_preserve_default_snapshot_output() {
+        let snapshot = json!([
+            {"role":"textbox","name":"Search","value":"raw upstream value","ref":"e1"}
+        ]);
+        assert_eq!(
+            render_aria_snapshot_as_yaml(&snapshot),
+            "- textbox \"Search\" [ref=e1]"
         );
     }
 }

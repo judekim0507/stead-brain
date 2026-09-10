@@ -185,6 +185,7 @@ pub(crate) struct PageInner {
 struct PageState {
     frames: HashMap<String, FrameData>,
     main_frame: Option<String>,
+    aria_snapshots: HashMap<(String, bool), String>,
     next_seq: u32,
     ready: bool,
     initialization_error: Option<String>,
@@ -727,6 +728,7 @@ impl Page {
                 state: Mutex::new(PageState {
                     frames: HashMap::from([(target_id.clone(), initial_frame)]),
                     main_frame: Some(target_id),
+                    aria_snapshots: HashMap::new(),
                     next_seq: 1,
                     ready: false,
                     initialization_error: None,
@@ -820,6 +822,19 @@ impl Page {
     }
     pub(crate) fn navigation_generation(&self) -> u64 {
         self.inner.state.lock().unwrap().navigation_generation
+    }
+    pub(crate) fn replace_aria_snapshot(
+        &self,
+        frame_id: &str,
+        interactive: bool,
+        snapshot: String,
+    ) -> Option<String> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .aria_snapshots
+            .insert((frame_id.to_owned(), interactive), snapshot)
     }
     pub(crate) async fn wait_for_action_navigation(
         &self,
@@ -2888,6 +2903,13 @@ fn update_frame_navigation(
         false,
     );
     let mut state = page.inner.state.lock().unwrap();
+    if state.main_frame.as_deref() == Some(id) {
+        state.aria_snapshots.clear();
+    } else {
+        state
+            .aria_snapshots
+            .retain(|(frame_id, _), _| frame_id != id);
+    }
     let descendants = descendant_ids(&state.frames, id);
     for child in descendants {
         if child != id {

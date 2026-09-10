@@ -293,6 +293,10 @@ pub struct ToolStatus {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Free-form detail for the UI: for `browser_exec`, the script while
+    /// running and a trimmed output preview on completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
