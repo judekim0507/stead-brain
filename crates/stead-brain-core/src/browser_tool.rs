@@ -820,6 +820,10 @@ impl ExecutionHost {
                 ));
             }
             (SteadwrightObject::Page(Some(page)), "url") => return Ok(json!(page.url())),
+            // Playwright always has a page; before the first navigation ours
+            // is about:blank and not closed.
+            (SteadwrightObject::Page(None), "url") => return Ok(json!("about:blank")),
+            (SteadwrightObject::Page(None), "isClosed") => return Ok(json!(false)),
             (SteadwrightObject::Page(Some(page)), "isClosed") => {
                 return Ok(json!(page.is_closed()));
             }
@@ -1206,7 +1210,9 @@ impl ExecutionHost {
     ) -> Result<Value, DispatchError> {
         let page = match page {
             Some(page) => page,
-            None if method == "goto" => {
+            // No tab yet: create one for any page operation, as Playwright's
+            // page always exists. (`close` on nothing is a no-op below.)
+            None if method != "close" => {
                 let context = self
                     .registry
                     .lock()
@@ -1224,11 +1230,7 @@ impl ExecutionHost {
                 }
                 page
             }
-            None => {
-                return Err(DispatchError::ordinary(
-                    "No current browser page. Call page.goto(url) first.",
-                ));
-            }
+            None => return Ok(Value::Null),
         };
         self.registry
             .lock()
