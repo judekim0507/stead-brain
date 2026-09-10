@@ -236,14 +236,14 @@ impl Locator {
 
     pub async fn all_inner_texts(&self) -> Result<Vec<String>> {
         strings(
-            self.evaluate_all("elements => elements.map(e => e.innerText)", Value::Null)
+            self.evaluate_all_utility("elements => elements.map(e => e.innerText)", Value::Null)
                 .await?,
         )
     }
 
     pub async fn all_text_contents(&self) -> Result<Vec<String>> {
         strings(
-            self.evaluate_all(
+            self.evaluate_all_utility(
                 "elements => elements.map(e => e.textContent || '')",
                 Value::Null,
             )
@@ -253,7 +253,7 @@ impl Locator {
 
     pub async fn inner_text(&self) -> Result<String> {
         string_value(
-            self.evaluate(
+            self.evaluate_utility(
                 "element => { if (!(element instanceof HTMLElement)) throw new Error('Node is not an HTMLElement'); return element.innerText; }",
                 Value::Null,
             )
@@ -263,7 +263,7 @@ impl Locator {
 
     pub async fn text_content(&self) -> Result<Option<String>> {
         match self
-            .evaluate("element => element.textContent", Value::Null)
+            .evaluate_utility("element => element.textContent", Value::Null)
             .await?
         {
             JsValue::Null | JsValue::Undefined => Ok(None),
@@ -274,7 +274,7 @@ impl Locator {
 
     pub async fn inner_html(&self) -> Result<String> {
         string_value(
-            self.evaluate("element => element.innerHTML", Value::Null)
+            self.evaluate_utility("element => element.innerHTML", Value::Null)
                 .await?,
         )
     }
@@ -302,7 +302,7 @@ impl Locator {
 
     pub async fn get_attribute(&self, name: &str) -> Result<Option<String>> {
         match self
-            .evaluate("(element, name) => element.getAttribute(name)", name)
+            .evaluate_utility("(element, name) => element.getAttribute(name)", name)
             .await?
         {
             JsValue::Null | JsValue::Undefined => Ok(None),
@@ -312,7 +312,14 @@ impl Locator {
     }
 
     pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {
-        element_bounding_box(&self.element_handle().await?).await
+        let Some(handle) = self
+            .frame
+            .query_selector_utility(&self.selector, true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        element_bounding_box(&handle).await
     }
 
     pub async fn is_visible(&self) -> Result<bool> {
@@ -357,6 +364,27 @@ impl Locator {
             )
             .await?;
         Ok(value.as_bool().unwrap_or(false))
+    }
+
+    async fn evaluate_utility(&self, expression: &str, arg: impl Into<CallArg>) -> Result<JsValue> {
+        let handle = self
+            .frame
+            .query_selector_utility(&self.selector, true)
+            .await?
+            .ok_or_else(|| Error::Evaluation("Element is not attached to the DOM".into()))?;
+        handle.0.evaluate(expression, arg).await
+    }
+
+    async fn evaluate_all_utility(
+        &self,
+        expression: &str,
+        arg: impl Into<CallArg>,
+    ) -> Result<JsValue> {
+        self.frame
+            .query_array_handle_local(&self.selector)
+            .await?
+            .evaluate(expression, arg)
+            .await
     }
 
     pub async fn click(&self, options: ActionOptions) -> Result<()> {
@@ -1520,7 +1548,7 @@ async fn clickable_point(
     let viewport = frame
         .page
         .main_frame()
-        .evaluate_json(
+        .evaluate_utility_json(
             "() => ({width: innerWidth, height: innerHeight})",
             Value::Null,
         )

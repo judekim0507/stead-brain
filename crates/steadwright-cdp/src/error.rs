@@ -9,6 +9,8 @@ pub enum CdpError {
         message: String,
         data: Option<Value>,
     },
+    #[error("{0}")]
+    SteadRejected(String),
     #[error("CDP connection disconnected")]
     Disconnected,
     #[error(transparent)]

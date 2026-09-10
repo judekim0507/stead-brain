@@ -1777,12 +1777,15 @@ impl BrainCore {
             pending_tools: self.pending_tools.clone(),
             tx: tx.clone(),
         });
-        let mut tools = vec![Arc::new(BrowserCodeTool::new(
-            session_id.to_string(),
-            bridge,
-            tab_contexts,
-            self.browser_runtimes.clone(),
-        )) as Arc<dyn AgentTool>];
+        let mut tools = vec![Arc::new(
+            BrowserCodeTool::new(
+                session_id.to_string(),
+                bridge,
+                tab_contexts,
+                self.browser_runtimes.clone(),
+            )
+            .with_event_sink(tx.clone(), request_id.to_string()),
+        ) as Arc<dyn AgentTool>];
         tools.extend(file_tools_for_session(
             Arc::new(self.files.clone()),
             Some(session_id.to_string()),

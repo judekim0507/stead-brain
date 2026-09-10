@@ -1,16 +1,21 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use serde_json::Value;
 use steadwright::Browser;
 use steadwright_cdp::chromium::{self, LaunchError, LaunchOptions, LaunchedChromium};
+use steadwright_cdp::transport::Incoming;
+use steadwright_cdp::{Transport, TransportError, WebSocketTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 static FIXTURE: OnceLock<Option<&'static Fixture>> = OnceLock::new();
@@ -25,6 +30,7 @@ pub struct Fixture {
     pub browser: Browser,
     pub origin_a: String,
     pub origin_b: String,
+    pub cdp_trace: CdpTrace,
     test_lock: Arc<tokio::sync::Mutex<()>>,
     _chromium: LaunchedChromium,
     _servers: [JoinHandle<()>; 2],
@@ -86,12 +92,18 @@ impl Fixture {
             }
             Err(error) => return Err(error.into()),
         };
-        let browser = Browser::connect_ws(&chromium.ws_url).await?;
+        let transport = WebSocketTransport::connect(&chromium.ws_url)
+            .await
+            .map_err(steadwright_cdp::CdpError::from)
+            .map_err(steadwright::Error::from)?;
+        let (transport, cdp_trace) = RecordingTransport::new(transport);
+        let browser = Browser::connect(transport).await?;
 
         Ok(Self {
             browser,
             origin_a,
             origin_b,
+            cdp_trace,
             test_lock: Arc::new(tokio::sync::Mutex::new(())),
             _chromium: chromium,
             _servers: [server_a, server_b],
@@ -108,6 +120,174 @@ impl Fixture {
 
     pub async fn new_page(&self) -> steadwright::Result<steadwright::Page> {
         self.browser.default_context().new_page().await
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CdpTrace {
+    state: Arc<Mutex<CdpTraceState>>,
+}
+
+#[derive(Default)]
+struct CdpTraceState {
+    commands: Vec<Value>,
+    utility_contexts: HashSet<u64>,
+    utility_objects: HashSet<String>,
+    utility_requests: HashSet<u64>,
+}
+
+impl CdpTrace {
+    pub fn clear_commands(&self) {
+        self.state.lock().unwrap().commands.clear();
+    }
+
+    pub fn runtime_main_world_commands(&self) -> Vec<Value> {
+        let state = self.state.lock().unwrap();
+        state
+            .commands
+            .iter()
+            .filter(
+                |command| match command.get("method").and_then(Value::as_str) {
+                    Some("Runtime.evaluate") => command
+                        .pointer("/params/contextId")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|context| !state.utility_contexts.contains(&context)),
+                    Some("Runtime.callFunctionOn") => command
+                        .pointer("/params/objectId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|object| !state.utility_objects.contains(object)),
+                    _ => false,
+                },
+            )
+            .cloned()
+            .collect()
+    }
+
+    fn record_command(&self, command: &Value) {
+        let Some(id) = command.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let method = command.get("method").and_then(Value::as_str);
+        let mut state = self.state.lock().unwrap();
+        let utility = match method {
+            Some("Runtime.evaluate") => command
+                .pointer("/params/contextId")
+                .and_then(Value::as_u64)
+                .is_some_and(|context| state.utility_contexts.contains(&context)),
+            Some("Runtime.callFunctionOn" | "Runtime.getProperties") => command
+                .pointer("/params/objectId")
+                .and_then(Value::as_str)
+                .is_some_and(|object| state.utility_objects.contains(object)),
+            Some("DOM.resolveNode") => command
+                .pointer("/params/executionContextId")
+                .and_then(Value::as_u64)
+                .is_some_and(|context| state.utility_contexts.contains(&context)),
+            _ => false,
+        };
+        if utility {
+            state.utility_requests.insert(id);
+        }
+        state.commands.push(command.clone());
+    }
+
+    fn record_incoming(&self, message: &str) {
+        let Ok(message) = serde_json::from_str::<Value>(message) else {
+            return;
+        };
+        let mut state = self.state.lock().unwrap();
+        if message.get("method").and_then(Value::as_str) == Some("Runtime.executionContextCreated")
+            && message
+                .pointer("/params/context/name")
+                .and_then(Value::as_str)
+                == Some("__steadwright")
+        {
+            if let Some(context) = message
+                .pointer("/params/context/id")
+                .and_then(Value::as_u64)
+            {
+                state.utility_contexts.insert(context);
+            }
+            return;
+        }
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        if state.utility_requests.remove(&id) {
+            collect_object_ids(message.get("result"), &mut state.utility_objects);
+        }
+    }
+}
+
+fn collect_object_ids(value: Option<&Value>, objects: &mut HashSet<String>) {
+    let Some(value) = value else { return };
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_object_ids(Some(value), objects);
+            }
+        }
+        Value::Object(entries) => {
+            if let Some(object) = entries.get("objectId").and_then(Value::as_str) {
+                objects.insert(object.to_owned());
+            }
+            for value in entries.values() {
+                collect_object_ids(Some(value), objects);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct RecordingTransport<T> {
+    inner: T,
+    incoming: Option<Incoming>,
+    trace: CdpTrace,
+}
+
+impl<T: Transport> RecordingTransport<T> {
+    fn new(mut inner: T) -> (Self, CdpTrace) {
+        let trace = CdpTrace::default();
+        let incoming_trace = trace.clone();
+        let mut source = inner.incoming();
+        let (sender, incoming) = mpsc::channel(128);
+        tokio::spawn(async move {
+            while let Some(message) = source.recv().await {
+                if let Ok(message) = &message {
+                    incoming_trace.record_incoming(message);
+                }
+                if sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (
+            Self {
+                inner,
+                incoming: Some(incoming),
+                trace: trace.clone(),
+            },
+            trace,
+        )
+    }
+}
+
+#[async_trait]
+impl<T: Transport + Sync> Transport for RecordingTransport<T> {
+    async fn send(&self, message: String) -> Result<(), TransportError> {
+        let command = serde_json::from_str(&message)
+            .map_err(|error| TransportError::InvalidMessage(error.to_string()))?;
+        self.trace.record_command(&command);
+        self.inner.send(message).await
+    }
+
+    fn incoming(&mut self) -> Incoming {
+        self.incoming
+            .take()
+            .expect("Transport::incoming may only be called once")
+    }
+
+    async fn close(&self) {
+        self.inner.close().await;
     }
 }
 

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use steadwright::{
-    Browser, ClickOptions, GotoOptions, JsValue, LoadState, MouseButton, ScreenshotFormat,
-    ScreenshotOptions, UrlMatcher, ViewportSize, WaitForUrlOptions,
+    ActionOptions, Browser, ByRoleOptions, ClickOptions, GotoOptions, JsValue, LoadState,
+    MouseButton, ScreenshotFormat, ScreenshotOptions, UrlMatcher, ViewportSize, WaitForUrlOptions,
 };
 use steadwright_cdp::transport::Incoming;
 use steadwright_cdp::{Transport, TransportError};
@@ -242,6 +242,49 @@ async fn title_and_content_reflect_the_document() {
     let content = page.content().await.unwrap();
     assert!(content.contains("<!DOCTYPE html>"));
     assert!(content.contains("Steadwright fixture index"));
+    page.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn internal_reads_and_role_click_stay_in_the_utility_world() {
+    let Some(fixture) = Fixture::get().await else {
+        return;
+    };
+    let page = fixture.new_page().await.unwrap();
+    fixture.cdp_trace.clear_commands();
+
+    page.goto(&fixture.url_a("/index.html"), GotoOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(page.title().await.unwrap(), "Steadwright fixtures");
+    page.get_by_role(
+        "button",
+        ByRoleOptions {
+            name: Some("before click".into()),
+            ..ByRoleOptions::default()
+        },
+    )
+    .click(ActionOptions::default())
+    .await
+    .unwrap();
+
+    let main_world = fixture.cdp_trace.runtime_main_world_commands();
+    assert!(
+        main_world.is_empty(),
+        "steadwright internal operations sent main-world Runtime commands: {main_world:#?}"
+    );
+
+    fixture.cdp_trace.clear_commands();
+    assert_eq!(
+        page.evaluate_json("document.title", Value::Null)
+            .await
+            .unwrap(),
+        json!("Steadwright fixtures")
+    );
+    assert!(
+        !fixture.cdp_trace.runtime_main_world_commands().is_empty(),
+        "the trace must distinguish an explicit main-world evaluation"
+    );
     page.close().await.unwrap();
 }
 

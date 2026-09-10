@@ -231,11 +231,21 @@ async fn read_messages(
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown protocol error");
-                    Err(CdpError::Protocol {
-                        code,
-                        message: format!("({}): {server_message}", request.method),
-                        data: error.get("data").cloned(),
-                    })
+                    if matches!(
+                        server_message,
+                        "stead: denied by user"
+                            | "stead: confirmation timed out"
+                            | "stead: read-only mode"
+                            | "stead: cancelled"
+                    ) {
+                        Err(CdpError::SteadRejected(server_message.to_owned()))
+                    } else {
+                        Err(CdpError::Protocol {
+                            code,
+                            message: format!("({}): {server_message}", request.method),
+                            data: error.get("data").cloned(),
+                        })
+                    }
                 } else {
                     Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
                 };
@@ -415,6 +425,35 @@ mod tests {
         let error = bad.await.unwrap().unwrap_err();
         assert!(matches!(error, CdpError::Protocol { code: -32000, .. }));
         assert_eq!(error.to_string(), "Protocol error (Target.bad): No target");
+    }
+
+    #[tokio::test]
+    async fn stead_rejections_preserve_the_server_message() {
+        let (connection, mut sent, incoming) = fake_connection();
+        for message in [
+            "stead: denied by user",
+            "stead: confirmation timed out",
+            "stead: read-only mode",
+            "stead: cancelled",
+        ] {
+            let command = tokio::spawn({
+                let connection = connection.clone();
+                async move { connection.send("Runtime.evaluate", json!({}), None).await }
+            });
+            let sent_command: Value = serde_json::from_str(&sent.recv().await.unwrap()).unwrap();
+            incoming
+                .send(Ok(json!({
+                    "id": sent_command["id"],
+                    "error": {"code": -32000, "message": message}
+                })
+                .to_string()))
+                .await
+                .unwrap();
+
+            let error = command.await.unwrap().unwrap_err();
+            assert!(matches!(error, CdpError::SteadRejected(_)));
+            assert_eq!(error.to_string(), message);
+        }
     }
 
     #[tokio::test]

@@ -900,14 +900,15 @@ impl Page {
     }
     pub async fn title(&self) -> Result<String> {
         Ok(self
-            .evaluate_json("document.title", Value::Null)
+            .main_frame()
+            .evaluate_utility_json("document.title", Value::Null)
             .await?
             .as_str()
             .unwrap_or_default()
             .to_owned())
     }
     pub async fn content(&self) -> Result<String> {
-        let value = self.evaluate_json("() => { let result = ''; if (document.doctype) result = new XMLSerializer().serializeToString(document.doctype); if (document.documentElement) result += document.documentElement.outerHTML; return result; }", Value::Null).await?;
+        let value = self.main_frame().evaluate_utility_json("() => { let result = ''; if (document.doctype) result = new XMLSerializer().serializeToString(document.doctype); if (document.documentElement) result += document.documentElement.outerHTML; return result; }", Value::Null).await?;
         Ok(value.as_str().unwrap_or_default().to_owned())
     }
     pub async fn wait_for_timeout(&self, milliseconds: u64) -> Result<()> {
@@ -1546,6 +1547,23 @@ impl Frame {
     }
     pub async fn evaluate_json(&self, expression: &str, arg: impl Into<CallArg>) -> Result<Value> {
         Ok(self.evaluate(expression, arg).await?.to_json())
+    }
+    pub(crate) async fn evaluate_utility(
+        &self,
+        expression: &str,
+        arg: impl Into<CallArg>,
+    ) -> Result<JsValue> {
+        let (context, session, _, _) = self.context_snapshot(World::Utility).await?;
+        self.evaluate_with_context(expression, vec![arg.into()], true, context, &session)
+            .await
+            .map(|value| value.0)
+    }
+    pub(crate) async fn evaluate_utility_json(
+        &self,
+        expression: &str,
+        arg: impl Into<CallArg>,
+    ) -> Result<Value> {
+        Ok(self.evaluate_utility(expression, arg).await?.to_json())
     }
     pub async fn evaluate_handle(
         &self,

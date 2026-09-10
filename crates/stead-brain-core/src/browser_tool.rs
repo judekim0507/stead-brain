@@ -14,7 +14,7 @@ use rquickjs::function::{Async, Func};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Promise, async_with};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use stead_brain_protocol::TabContext;
+use stead_brain_protocol::{BrainEvent, ResponseEnvelope, TabContext, ToolStatus};
 use steadwright::{
     ActionOptions, AriaSnapshotOptions, Browser, BrowserContext, ByRoleOptions, CallArg, Dialog,
     DialogType, Download, ElementHandle, FileChooser, Frame, FrameLocator, GotoOptions, JsHandle,
@@ -473,8 +473,8 @@ enum SteadwrightObject {
     Context(BrowserContext),
     Page(Option<Page>),
     Frame(Frame),
-    Locator(Locator),
-    FrameLocator(FrameLocator),
+    Locator(DescribedLocator),
+    FrameLocator(DescribedFrameLocator),
     JsHandle(JsHandle),
     ElementHandle(ElementHandle),
     Response(Response),
@@ -483,6 +483,34 @@ enum SteadwrightObject {
     Download(Download),
     Keyboard(Keyboard),
     Mouse(Mouse),
+}
+
+#[derive(Clone)]
+struct DescribedLocator {
+    value: Locator,
+    description: String,
+}
+
+impl std::ops::Deref for DescribedLocator {
+    type Target = Locator;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+#[derive(Clone)]
+struct DescribedFrameLocator {
+    value: FrameLocator,
+    description: String,
+}
+
+impl std::ops::Deref for DescribedFrameLocator {
+    type Target = FrameLocator;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
 }
 
 impl SteadwrightObject {
@@ -585,6 +613,10 @@ impl Registry {
     }
 
     fn locator_arg(&self, value: &Value) -> Result<Locator, DispatchError> {
+        Ok(self.described_locator_arg(value)?.value)
+    }
+
+    fn described_locator_arg(&self, value: &Value) -> Result<DescribedLocator, DispatchError> {
         let id = value
             .get("__sw_ref_arg")
             .and_then(Value::as_u64)
@@ -637,11 +669,76 @@ struct CapturedImage {
     mime_type: String,
 }
 
+#[derive(Clone)]
+struct BrowserEventSink {
+    tx: mpsc::UnboundedSender<ResponseEnvelope>,
+    session_id: String,
+    request_id: String,
+}
+
+impl BrowserEventSink {
+    fn emit(&self, tool_call_id: impl Into<String>, status: &str, message: &str) {
+        let _ = self.tx.send(ResponseEnvelope::session_event(
+            Some(self.request_id.clone()),
+            self.session_id.clone(),
+            BrainEvent::ToolStatus(ToolStatus {
+                tool_call_id: tool_call_id.into(),
+                status: status.to_string(),
+                message: Some(message.to_string()),
+            }),
+        ));
+    }
+}
+
+struct OperationProgress<'a> {
+    sink: &'a BrowserEventSink,
+    tool_call_id: String,
+    message: String,
+    finished: bool,
+}
+
+impl<'a> OperationProgress<'a> {
+    fn start(
+        sink: &'a BrowserEventSink,
+        parent_tool_call_id: &str,
+        sequence: u64,
+        message: String,
+    ) -> Self {
+        let tool_call_id = format!("{parent_tool_call_id}:op:{sequence}");
+        sink.emit(&tool_call_id, "running", &message);
+        Self {
+            sink,
+            tool_call_id,
+            message,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, succeeded: bool) {
+        self.sink.emit(
+            &self.tool_call_id,
+            if succeeded { "completed" } else { "failed" },
+            &self.message,
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for OperationProgress<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.sink.emit(&self.tool_call_id, "failed", &self.message);
+        }
+    }
+}
+
 struct ExecutionHost {
     registry: Arc<StdMutex<Registry>>,
     bridge: Arc<dyn BrowserToolBridge>,
     raw: RawCdp,
     tool_call_id: String,
+    event_sink: Option<BrowserEventSink>,
+    operation_sequence: AtomicU64,
     credential_sequence: AtomicU64,
     cancel: CancellationToken,
     images: Arc<StdMutex<Vec<CapturedImage>>>,
@@ -656,15 +753,40 @@ impl ExecutionHost {
         method: &str,
         args: Value,
     ) -> Result<Value, DispatchError> {
-        if receiver_id == 0 {
-            return self.dispatch_credentials(method, args).await;
+        let receiver = if receiver_id == 0 {
+            None
+        } else {
+            Some(
+                self.registry
+                    .lock()
+                    .expect("registry mutex poisoned")
+                    .get(receiver_id)?,
+            )
+        };
+        let progress = self
+            .event_sink
+            .as_ref()
+            .zip(operation_message(
+                operation_target(receiver.as_ref()),
+                method,
+                &args,
+            ))
+            .map(|(sink, message)| {
+                OperationProgress::start(
+                    sink,
+                    &self.tool_call_id,
+                    self.operation_sequence.fetch_add(1, Ordering::Relaxed),
+                    message,
+                )
+            });
+        let result = match receiver {
+            Some(receiver) => self.dispatch_object(receiver, method, args).await,
+            None => self.dispatch_credentials(method, args).await,
+        };
+        if let Some(progress) = progress {
+            progress.finish(result.is_ok());
         }
-        let receiver = self
-            .registry
-            .lock()
-            .expect("registry mutex poisoned")
-            .get(receiver_id)?;
-        self.dispatch_object(receiver, method, args).await
+        result
     }
 
     fn dispatch_sync(
@@ -787,62 +909,136 @@ impl ExecutionHost {
                 SteadwrightObject::Frame(page.main_frame())
             }
             (SteadwrightObject::Page(Some(page)), "locator") => {
-                SteadwrightObject::Locator(page.locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: page.locator(selector),
+                    description: format!("locator({})", js_string(selector)),
+                })
             }
             (SteadwrightObject::Page(Some(page)), "frameLocator") => {
-                SteadwrightObject::FrameLocator(page.frame_locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::FrameLocator(DescribedFrameLocator {
+                    value: page.frame_locator(selector),
+                    description: format!("frameLocator({})", js_string(selector)),
+                })
             }
             (SteadwrightObject::Frame(frame), "locator") => {
-                SteadwrightObject::Locator(frame.locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: frame.locator(selector),
+                    description: format!("locator({})", js_string(selector)),
+                })
             }
             (SteadwrightObject::Frame(frame), "frameLocator") => {
-                SteadwrightObject::FrameLocator(frame.frame_locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::FrameLocator(DescribedFrameLocator {
+                    value: frame.frame_locator(selector),
+                    description: format!("frameLocator({})", js_string(selector)),
+                })
             }
             (SteadwrightObject::Locator(locator), "locator") => {
-                SteadwrightObject::Locator(locator.locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.locator(selector),
+                    description: format!(
+                        "{}.locator({})",
+                        locator.description,
+                        js_string(selector)
+                    ),
+                })
             }
             (SteadwrightObject::Locator(locator), "frameLocator") => {
-                SteadwrightObject::FrameLocator(locator.frame_locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::FrameLocator(DescribedFrameLocator {
+                    value: locator.frame_locator(selector),
+                    description: format!(
+                        "{}.frameLocator({})",
+                        locator.description,
+                        js_string(selector)
+                    ),
+                })
             }
             (SteadwrightObject::Locator(locator), "contentFrame") => {
-                SteadwrightObject::FrameLocator(locator.content_frame())
+                SteadwrightObject::FrameLocator(DescribedFrameLocator {
+                    value: locator.content_frame(),
+                    description: format!("{}.contentFrame()", locator.description),
+                })
             }
             (SteadwrightObject::Locator(locator), "first") => {
-                SteadwrightObject::Locator(locator.first())
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.first(),
+                    description: format!("{}.first()", locator.description),
+                })
             }
             (SteadwrightObject::Locator(locator), "last") => {
-                SteadwrightObject::Locator(locator.last())
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.last(),
+                    description: format!("{}.last()", locator.description),
+                })
             }
             (SteadwrightObject::Locator(locator), "nth") => {
-                SteadwrightObject::Locator(locator.nth(i32_arg(&args, 0)?))
+                let index = i32_arg(&args, 0)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.nth(index),
+                    description: format!("{}.nth({index})", locator.description),
+                })
             }
             (SteadwrightObject::Locator(locator), "filter") => {
-                SteadwrightObject::Locator(locator.filter(locator_filter(
-                    &registry,
-                    arg(&args, 0).unwrap_or(&Value::Null),
-                )?)?)
+                let options = arg(&args, 0).unwrap_or(&Value::Null);
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.filter(locator_filter(&registry, options)?)?,
+                    description: format!("{}.filter({})", locator.description, js_value(options)),
+                })
             }
-            (SteadwrightObject::Locator(locator), "and") => SteadwrightObject::Locator(
-                locator.and_(&registry.locator_arg(arg_required(&args, 0)?)?)?,
-            ),
-            (SteadwrightObject::Locator(locator), "or") => SteadwrightObject::Locator(
-                locator.or_(&registry.locator_arg(arg_required(&args, 0)?)?)?,
-            ),
+            (SteadwrightObject::Locator(locator), "and") => {
+                let other = registry.described_locator_arg(arg_required(&args, 0)?)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.and_(&other.value)?,
+                    description: format!("{}.and({})", locator.description, other.description),
+                })
+            }
+            (SteadwrightObject::Locator(locator), "or") => {
+                let other = registry.described_locator_arg(arg_required(&args, 0)?)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.or_(&other.value)?,
+                    description: format!("{}.or({})", locator.description, other.description),
+                })
+            }
             (SteadwrightObject::FrameLocator(locator), "locator") => {
-                SteadwrightObject::Locator(locator.locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator.locator(selector),
+                    description: format!(
+                        "{}.locator({})",
+                        locator.description,
+                        js_string(selector)
+                    ),
+                })
             }
             (SteadwrightObject::FrameLocator(locator), "frameLocator") => {
-                SteadwrightObject::FrameLocator(locator.frame_locator(string_arg(&args, 0)?))
+                let selector = string_arg(&args, 0)?;
+                SteadwrightObject::FrameLocator(DescribedFrameLocator {
+                    value: locator.frame_locator(selector),
+                    description: format!(
+                        "{}.frameLocator({})",
+                        locator.description,
+                        js_string(selector)
+                    ),
+                })
             }
             (_, "getByRole") => {
                 let role = string_arg(&args, 0)?;
                 let options = by_role_options(arg(&args, 1).unwrap_or(&Value::Null))?;
-                SteadwrightObject::Locator(match &receiver {
+                let value = match &receiver {
                     SteadwrightObject::Page(Some(v)) => v.get_by_role(role, options),
                     SteadwrightObject::Frame(v) => v.get_by_role(role, options),
                     SteadwrightObject::Locator(v) => v.get_by_role(role, options),
                     SteadwrightObject::FrameLocator(v) => v.get_by_role(role, options),
                     _ => return Err(DispatchError::unknown(&receiver, method)),
+                };
+                SteadwrightObject::Locator(DescribedLocator {
+                    value,
+                    description: locator_method_description(&receiver, method, &args)?,
                 })
             }
             (
@@ -855,7 +1051,10 @@ impl ExecutionHost {
                     .and_then(|v| v.get("exact").or(Some(v)))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                SteadwrightObject::Locator(locator_text_method(&receiver, method, text, exact)?)
+                SteadwrightObject::Locator(DescribedLocator {
+                    value: locator_text_method(&receiver, method, text, exact)?,
+                    description: locator_method_description(&receiver, method, &args)?,
+                })
             }
             _ => return Err(DispatchError::unknown(&receiver, method)),
         };
@@ -1209,7 +1408,7 @@ impl ExecutionHost {
 
     async fn dispatch_locator(
         &self,
-        locator: Locator,
+        locator: DescribedLocator,
         method: &str,
         args: Value,
         receiver: &SteadwrightObject,
@@ -1222,7 +1421,13 @@ impl ExecutionHost {
                     .all()
                     .await?
                     .into_iter()
-                    .map(|v| self.ref_value(SteadwrightObject::Locator(v)))
+                    .enumerate()
+                    .map(|(index, value)| {
+                        self.ref_value(SteadwrightObject::Locator(DescribedLocator {
+                            value,
+                            description: format!("{}.nth({index})", locator.description),
+                        }))
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             "elementHandle" => self.ref_value(SteadwrightObject::ElementHandle(
@@ -1792,6 +1997,11 @@ struct BrowserJsRuntime {
     execution_lock: Mutex<()>,
 }
 
+struct ExecutionProgress {
+    tool_call_id: String,
+    event_sink: Option<BrowserEventSink>,
+}
+
 impl BrowserJsRuntime {
     async fn new() -> Result<Self, String> {
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
@@ -1811,7 +2021,7 @@ impl BrowserJsRuntime {
         browser: Arc<BrowserConnection>,
         attached: &[TabContext],
         bridge: Arc<dyn BrowserToolBridge>,
-        tool_call_id: &str,
+        progress: ExecutionProgress,
         cancel: CancellationToken,
     ) -> Result<ExecutionOutcome, JsFailure> {
         let _execution = self.execution_lock.lock().await;
@@ -1855,7 +2065,9 @@ impl BrowserJsRuntime {
             registry: self.registry.clone(),
             bridge,
             raw: browser.raw.clone(),
-            tool_call_id: tool_call_id.to_string(),
+            tool_call_id: progress.tool_call_id,
+            event_sink: progress.event_sink,
+            operation_sequence: AtomicU64::new(0),
             credential_sequence: AtomicU64::new(0),
             cancel: execution_cancel.clone(),
             images: images.clone(),
@@ -2053,6 +2265,7 @@ pub(crate) struct BrowserCodeTool {
     bridge: Arc<dyn BrowserToolBridge>,
     attached: Vec<TabContext>,
     runtimes: Arc<BrowserRuntimePool>,
+    event_sink: Option<BrowserEventSink>,
 }
 
 impl BrowserCodeTool {
@@ -2075,31 +2288,28 @@ impl BrowserCodeTool {
             bridge,
             attached,
             runtimes,
+            event_sink: None,
         }
     }
-}
 
-#[async_trait]
-impl AgentTool for BrowserCodeTool {
-    fn definition(&self) -> &pie_ai::Tool {
-        &self.definition
-    }
-    fn label(&self) -> &str {
-        "browser_exec"
-    }
-    fn execution_mode(&self) -> Option<ToolExecutionMode> {
-        Some(ToolExecutionMode::Sequential)
-    }
-    fn permission_classification(&self, _prepared_args: &Value) -> PermissionClassification {
-        PermissionClassification::Allow
+    pub(crate) fn with_event_sink(
+        mut self,
+        tx: mpsc::UnboundedSender<ResponseEnvelope>,
+        request_id: String,
+    ) -> Self {
+        self.event_sink = Some(BrowserEventSink {
+            tx,
+            session_id: self.session_id.clone(),
+            request_id,
+        });
+        self
     }
 
-    async fn execute(
+    async fn execute_inner(
         &self,
         tool_call_id: &str,
         params: Value,
         cancel: CancellationToken,
-        _on_update: Option<AgentToolUpdate>,
     ) -> Result<AgentToolResult, AgentToolError> {
         let code = params
             .get("code")
@@ -2124,7 +2334,10 @@ impl AgentTool for BrowserCodeTool {
                 browser,
                 &self.attached,
                 self.bridge.clone(),
-                tool_call_id,
+                ExecutionProgress {
+                    tool_call_id: tool_call_id.to_string(),
+                    event_sink: self.event_sink.clone(),
+                },
                 cancel,
             )
             .await
@@ -2150,6 +2363,299 @@ impl AgentTool for BrowserCodeTool {
             details: summary,
             terminate: None,
         })
+    }
+}
+
+#[async_trait]
+impl AgentTool for BrowserCodeTool {
+    fn definition(&self) -> &pie_ai::Tool {
+        &self.definition
+    }
+    fn label(&self) -> &str {
+        "browser_exec"
+    }
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        Some(ToolExecutionMode::Sequential)
+    }
+    fn permission_classification(&self, _prepared_args: &Value) -> PermissionClassification {
+        PermissionClassification::Allow
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: Value,
+        cancel: CancellationToken,
+        _on_update: Option<AgentToolUpdate>,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        if let Some(sink) = &self.event_sink {
+            sink.emit(tool_call_id, "running", "browser_exec");
+        }
+        let result = self.execute_inner(tool_call_id, params, cancel).await;
+        if let Some(sink) = &self.event_sink {
+            sink.emit(
+                tool_call_id,
+                if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                "browser_exec",
+            );
+        }
+        result
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OperationTarget<'a> {
+    Credentials,
+    Browser,
+    Context,
+    Page,
+    Frame,
+    Locator(&'a str),
+    FrameLocator,
+    JsHandle,
+    ElementHandle,
+    Response,
+    Dialog,
+    FileChooser,
+    Download,
+    Keyboard,
+    Mouse,
+}
+
+fn operation_target(receiver: Option<&SteadwrightObject>) -> OperationTarget<'_> {
+    match receiver {
+        None => OperationTarget::Credentials,
+        Some(SteadwrightObject::Browser(_)) => OperationTarget::Browser,
+        Some(SteadwrightObject::Context(_)) => OperationTarget::Context,
+        Some(SteadwrightObject::Page(_)) => OperationTarget::Page,
+        Some(SteadwrightObject::Frame(_)) => OperationTarget::Frame,
+        Some(SteadwrightObject::Locator(locator)) => OperationTarget::Locator(&locator.description),
+        Some(SteadwrightObject::FrameLocator(_)) => OperationTarget::FrameLocator,
+        Some(SteadwrightObject::JsHandle(_)) => OperationTarget::JsHandle,
+        Some(SteadwrightObject::ElementHandle(_)) => OperationTarget::ElementHandle,
+        Some(SteadwrightObject::Response(_)) => OperationTarget::Response,
+        Some(SteadwrightObject::Dialog(_)) => OperationTarget::Dialog,
+        Some(SteadwrightObject::FileChooser(_)) => OperationTarget::FileChooser,
+        Some(SteadwrightObject::Download(_)) => OperationTarget::Download,
+        Some(SteadwrightObject::Keyboard(_)) => OperationTarget::Keyboard,
+        Some(SteadwrightObject::Mouse(_)) => OperationTarget::Mouse,
+    }
+}
+
+fn operation_message(target: OperationTarget<'_>, method: &str, args: &Value) -> Option<String> {
+    let message = match target {
+        OperationTarget::Credentials => match method {
+            "credentials.list" => "credentials list".to_string(),
+            "credentials.fill" | "credentials.fillTotp" => "credentials fill".to_string(),
+            _ => return None,
+        },
+        OperationTarget::Browser => match method {
+            "newPage" => "newPage".to_string(),
+            "close" => "close".to_string(),
+            _ => return None,
+        },
+        OperationTarget::Context => match method {
+            "newPage" => "newPage".to_string(),
+            _ => return None,
+        },
+        OperationTarget::Page => match method {
+            "goto" => argument_message("goto", args, 0),
+            "reload" => "reload".to_string(),
+            "goBack" => "back".to_string(),
+            "goForward" => "forward".to_string(),
+            "bringToFront" => "bring to front".to_string(),
+            "close" => "close".to_string(),
+            "evaluate" | "evaluateHandle" => "evaluate".to_string(),
+            "ariaSnapshot" => "ariaSnapshot".to_string(),
+            "screenshot" => "screenshot".to_string(),
+            "waitForTimeout" => match arg(args, 0).and_then(Value::as_u64) {
+                Some(timeout) => format!("wait {timeout}ms"),
+                None => "wait".to_string(),
+            },
+            "waitForFunction" => "waitForFunction".to_string(),
+            "waitForSelector" => argument_message("waitForSelector", args, 0),
+            "waitForLoadState" => format!(
+                "waitForLoadState {}",
+                arg(args, 0).and_then(Value::as_str).unwrap_or("load")
+            ),
+            "waitForURL" => argument_message("waitForURL", args, 0),
+            "waitForResponse" => argument_message("waitForResponse", args, 0),
+            "waitForRequest" => argument_message("waitForRequest", args, 0),
+            "waitForEvent" => argument_message("waitForEvent", args, 0),
+            "setViewportSize" => "set viewport size".to_string(),
+            _ => return None,
+        },
+        OperationTarget::Frame => match method {
+            "goto" => argument_message("goto", args, 0),
+            "evaluate" | "evaluateHandle" => "evaluate".to_string(),
+            "ariaSnapshot" => "ariaSnapshot".to_string(),
+            "waitForFunction" => "waitForFunction".to_string(),
+            "waitForSelector" => argument_message("waitForSelector", args, 0),
+            _ => return None,
+        },
+        OperationTarget::Locator(description) => match method {
+            "click"
+            | "dblclick"
+            | "hover"
+            | "tap"
+            | "dragTo"
+            | "fill"
+            | "type"
+            | "clear"
+            | "check"
+            | "uncheck"
+            | "setChecked"
+            | "setInputFiles"
+            | "focus"
+            | "blur"
+            | "selectText"
+            | "dispatchEvent"
+            | "scrollIntoViewIfNeeded"
+            | "highlight" => format!("{} {}", locator_operation_name(method), description),
+            "press" => argument_message("press", args, 0),
+            "selectOption" => "select option".to_string(),
+            "waitFor" => format!("waitFor {description}"),
+            "ariaSnapshot" => "ariaSnapshot".to_string(),
+            "screenshot" => "screenshot".to_string(),
+            "evaluate" | "evaluateHandle" => "evaluate".to_string(),
+            "evaluateAll" => "evaluateAll".to_string(),
+            _ => return None,
+        },
+        OperationTarget::JsHandle => match method {
+            "evaluate" | "evaluateHandle" => "evaluate".to_string(),
+            _ => return None,
+        },
+        OperationTarget::ElementHandle => match method {
+            "screenshot" => "screenshot".to_string(),
+            "evaluate" | "evaluateHandle" => "evaluate".to_string(),
+            _ => return None,
+        },
+        OperationTarget::Dialog => match method {
+            "accept" => "accept dialog".to_string(),
+            "dismiss" => "dismiss dialog".to_string(),
+            _ => return None,
+        },
+        OperationTarget::FileChooser => match method {
+            "setFiles" => "set input files".to_string(),
+            _ => return None,
+        },
+        OperationTarget::Keyboard => match method {
+            "press" => argument_message("press", args, 0),
+            "type" => "type".to_string(),
+            "insertText" => "insert text".to_string(),
+            "down" | "up" => argument_message(method, args, 0),
+            _ => return None,
+        },
+        OperationTarget::Mouse => match method {
+            "move" => "move mouse".to_string(),
+            "click" => "click".to_string(),
+            "dblclick" => "dblclick".to_string(),
+            "down" => "mouse down".to_string(),
+            "up" => "mouse up".to_string(),
+            "wheel" => "scroll".to_string(),
+            _ => return None,
+        },
+        OperationTarget::FrameLocator | OperationTarget::Response | OperationTarget::Download => {
+            return None;
+        }
+    };
+    Some(truncate_message(&message, 80))
+}
+
+fn locator_operation_name(method: &str) -> &str {
+    match method {
+        "setChecked" => "set checked",
+        "setInputFiles" => "set input files",
+        "selectText" => "select text",
+        "dispatchEvent" => "dispatch event",
+        "scrollIntoViewIfNeeded" => "scroll into view",
+        _ => method,
+    }
+}
+
+fn argument_message(prefix: &str, args: &Value, index: usize) -> String {
+    match arg(args, index) {
+        Some(Value::String(value)) => format!("{prefix} {value}"),
+        Some(value) => format!("{prefix} {}", js_value(value)),
+        None => prefix.to_string(),
+    }
+}
+
+fn truncate_message(message: &str, max_chars: usize) -> String {
+    if message.chars().count() <= max_chars {
+        return message.to_string();
+    }
+    let mut truncated = message
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn locator_method_description(
+    receiver: &SteadwrightObject,
+    method: &str,
+    args: &Value,
+) -> Result<String, DispatchError> {
+    let call = method_call_description(method, args)?;
+    Ok(match receiver {
+        SteadwrightObject::Locator(locator) => format!("{}.{}", locator.description, call),
+        SteadwrightObject::FrameLocator(locator) => {
+            format!("{}.{}", locator.description, call)
+        }
+        _ => call,
+    })
+}
+
+fn method_call_description(method: &str, args: &Value) -> Result<String, DispatchError> {
+    let values = args
+        .as_array()
+        .ok_or_else(|| DispatchError::ordinary("Browser method arguments must be an array"))?;
+    Ok(format!(
+        "{method}({})",
+        values.iter().map(js_value).collect::<Vec<_>>().join(", ")
+    ))
+}
+
+fn js_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("'{escaped}'")
+}
+
+fn js_value(value: &Value) -> String {
+    if let Some(regex) = value.get("__sw_regex").and_then(Value::as_str) {
+        let flags = value
+            .get("__sw_flags")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return format!("/{regex}/{flags}");
+    }
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => js_string(value),
+        Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(js_value).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Object(values) => format!(
+            "{{ {} }}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", js_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -2724,6 +3230,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_script_emits_parent_and_operation_tool_statuses() {
+        #[derive(Clone)]
+        struct FakeScriptBrowserApi {
+            sink: BrowserEventSink,
+            sequence: Arc<AtomicU64>,
+            locator_description: Arc<StdMutex<Option<String>>>,
+        }
+
+        impl FakeScriptBrowserApi {
+            fn dispatch_sync(&self, receiver: u64, method: &str, args: &str) -> String {
+                let result = (|| {
+                    if receiver != 1 || method != "getByRole" {
+                        return Err(DispatchError::ordinary("unexpected fake sync call"));
+                    }
+                    let args = serde_json::from_str::<Value>(args)
+                        .map_err(|error| DispatchError::ordinary(error.to_string()))?;
+                    *self.locator_description.lock().unwrap() =
+                        Some(method_call_description(method, &args)?);
+                    Ok(json!({"__sw_ref": 2, "__sw_type": "Locator"}))
+                })();
+                envelope(result).to_string()
+            }
+
+            async fn dispatch(&self, receiver: u64, method: &str, args: &str) -> String {
+                let result = (|| {
+                    let args = serde_json::from_str::<Value>(args)
+                        .map_err(|error| DispatchError::ordinary(error.to_string()))?;
+                    let locator_description = self.locator_description.lock().unwrap().clone();
+                    let target = match receiver {
+                        1 => OperationTarget::Page,
+                        2 => OperationTarget::Locator(locator_description.as_deref().ok_or_else(
+                            || DispatchError::ordinary("fake locator was not constructed"),
+                        )?),
+                        _ => return Err(DispatchError::ordinary("unexpected fake receiver")),
+                    };
+                    let message = operation_message(target, method, &args)
+                        .ok_or_else(|| DispatchError::ordinary("unexpected fake operation"))?;
+                    let progress = OperationProgress::start(
+                        &self.sink,
+                        "parent-call",
+                        self.sequence.fetch_add(1, Ordering::Relaxed),
+                        message,
+                    );
+                    let result = match (receiver, method) {
+                        (1, "goto") | (2, "click") => Ok(Value::Null),
+                        _ => Err(DispatchError::ordinary("unexpected fake operation")),
+                    };
+                    progress.finish(result.is_ok());
+                    result
+                })();
+                envelope(result).to_string()
+            }
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = BrowserEventSink {
+            tx,
+            session_id: "session-a".into(),
+            request_id: "request-a".into(),
+        };
+        let api = FakeScriptBrowserApi {
+            sink: sink.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            locator_description: Arc::new(StdMutex::new(None)),
+        };
+        sink.emit("parent-call", "running", "browser_exec");
+
+        let runtime = AsyncRuntime::new().unwrap();
+        let context = AsyncContext::full(&runtime).await.unwrap();
+        let async_api = api.clone();
+        let call = move |receiver: u64, method: String, args: String| {
+            let api = async_api.clone();
+            async move { Ok::<String, rquickjs::Error>(api.dispatch(receiver, &method, &args).await) }
+        };
+        let sync_api = api.clone();
+        let sync_call = move |receiver: u64, method: String, args: String| {
+            sync_api.dispatch_sync(receiver, &method, &args)
+        };
+        let result = async_with!(context => |ctx| {
+            ctx.eval::<(), _>(BOOTSTRAP).unwrap();
+            ctx.globals()
+                .set("__steadwright_call", Func::from(Async(call)))
+                .unwrap();
+            ctx.globals()
+                .set("__steadwright_sync_call", Func::from(sync_call))
+                .unwrap();
+            ctx.globals()
+                .set("__steadwright_log", Func::from(|_: String, _: String| {}))
+                .unwrap();
+            ctx.eval::<(), _>("__steadwrightInstall({browser:3,context:4,page:1})")
+                .unwrap();
+            let promise = ctx
+                .eval::<Promise, _>(
+                    "(async () => { const u = 'https://www.apple.com/ca/store'; await page.goto(u); await page.getByRole('button', {name:'Go'}).click(); return 1 })()",
+                )
+                .unwrap();
+            promise.into_future::<i32>().await.unwrap()
+        })
+        .await;
+        assert_eq!(result, 1);
+        sink.emit("parent-call", "completed", "browser_exec");
+
+        let statuses = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| {
+                assert_eq!(event.request_id.as_deref(), Some("request-a"));
+                assert_eq!(event.session_id.as_deref(), Some("session-a"));
+                match event.event {
+                    BrainEvent::ToolStatus(status) => status,
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ToolStatus {
+                    tool_call_id: "parent-call".into(),
+                    status: "running".into(),
+                    message: Some("browser_exec".into()),
+                },
+                ToolStatus {
+                    tool_call_id: "parent-call:op:0".into(),
+                    status: "running".into(),
+                    message: Some("goto https://www.apple.com/ca/store".into()),
+                },
+                ToolStatus {
+                    tool_call_id: "parent-call:op:0".into(),
+                    status: "completed".into(),
+                    message: Some("goto https://www.apple.com/ca/store".into()),
+                },
+                ToolStatus {
+                    tool_call_id: "parent-call:op:1".into(),
+                    status: "running".into(),
+                    message: Some("click getByRole('button', { name: 'Go' })".into()),
+                },
+                ToolStatus {
+                    tool_call_id: "parent-call:op:1".into(),
+                    status: "completed".into(),
+                    message: Some("click getByRole('button', { name: 'Go' })".into()),
+                },
+                ToolStatus {
+                    tool_call_id: "parent-call".into(),
+                    status: "completed".into(),
+                    message: Some("browser_exec".into()),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn credential_bridge_preserves_marker_payloads_and_unique_ids() {
         let bridge = Arc::new(RecordingBridge::default());
         let host = test_host_with_bridge(bridge.clone());
@@ -2820,6 +3476,8 @@ mod tests {
                 next_id: Arc::new(AtomicU64::new(RAW_CDP_ID_BASE)),
             },
             tool_call_id: "test".into(),
+            event_sink: None,
+            operation_sequence: AtomicU64::new(0),
             credential_sequence: AtomicU64::new(0),
             cancel: CancellationToken::new(),
             images: Arc::new(StdMutex::new(Vec::new())),
