@@ -17,6 +17,8 @@ pub enum Error {
     #[error("{0}")]
     Navigation(String),
     #[error("{0}")]
+    Network(String),
+    #[error("{0}")]
     InvalidArgument(String),
     #[error("Not implemented: {0}")]
     NotImplemented(&'static str),

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::ElementHandle;
 use crate::JsHandle;
@@ -105,20 +105,83 @@ impl Default for WaitForUrlOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct Response {
     pub url: String,
     pub status: u16,
     pub ok: bool,
     pub headers: HashMap<String, String>,
+    pub mime_type: String,
+    pub(crate) request: Box<Request>,
+    pub(crate) redirect: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("url", &self.url)
+            .field("status", &self.status)
+            .field("ok", &self.ok)
+            .field("headers", &self.headers)
+            .field("mime_type", &self.mime_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Response {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && self.status == other.status
+            && self.ok == other.ok
+            && self.headers == other.headers
+            && self.mime_type == other.mime_type
+    }
+}
+
+#[derive(Clone)]
 pub struct Request {
     pub url: String,
     pub method: String,
+    pub resource_type: String,
     pub headers: HashMap<String, String>,
     pub post_data: Option<String>,
+    pub(crate) record: Arc<crate::browser::NetworkRequest>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("resource_type", &self.resource_type)
+            .field("headers", &self.headers)
+            .field("post_data", &self.post_data)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && self.method == other.method
+            && self.resource_type == other.resource_type
+            && self.headers == other.headers
+            && self.post_data == other.post_data
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RequestTiming {
+    pub start_time: SystemTime,
+    pub duration_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RequestFilter {
+    pub url_glob: Option<String>,
+    pub resource_types: Option<Vec<String>>,
+    pub since: Option<Instant>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

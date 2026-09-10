@@ -391,11 +391,10 @@ async fn serve_connection(
         }
     }
 
-    let request = String::from_utf8_lossy(&request);
-    let Some(target) = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_ascii_whitespace().nth(1))
+    let Some(header_end) = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
     else {
         return write_response(
             &mut stream,
@@ -406,8 +405,88 @@ async fn serve_connection(
         )
         .await;
     };
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let request_head = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = request_head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > 64 * 1024 {
+        return write_response(
+            &mut stream,
+            400,
+            "text/plain; charset=utf-8",
+            b"request body too large",
+            &[],
+        )
+        .await;
+    }
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&chunk[..read]);
+    }
+
+    let request_head = String::from_utf8_lossy(&request[..header_end]);
+    let Some((method, target)) = request_head.lines().next().and_then(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        Some((fields.next()?, fields.next()?))
+    }) else {
+        return write_response(
+            &mut stream,
+            400,
+            "text/plain; charset=utf-8",
+            b"bad request",
+            &[],
+        )
+        .await;
+    };
+    let method = method.to_owned();
+    let target = target.to_owned();
+    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     let query = parse_query(query);
+
+    if path == "/api/items" {
+        return write_response(
+            &mut stream,
+            200,
+            "application/json; charset=utf-8",
+            br#"{"items":[{"id":1,"name":"alpha"},{"id":2,"name":"beta"}]}"#,
+            &[("Access-Control-Allow-Origin", "*")],
+        )
+        .await;
+    }
+
+    if path == "/api/echo" {
+        if method != "POST" {
+            return write_response(
+                &mut stream,
+                400,
+                "text/plain; charset=utf-8",
+                b"expected POST",
+                &[],
+            )
+            .await;
+        }
+        let body = &request[header_end..header_end + content_length];
+        return write_response(
+            &mut stream,
+            200,
+            "application/json; charset=utf-8",
+            body,
+            &[("Access-Control-Allow-Origin", "*")],
+        )
+        .await;
+    }
+
+    if path == "/api/fail" {
+        // A clean close before any HTTP response gives Chromium a deterministic
+        // Network.loadingFailed event without depending on DNS or a closed port.
+        return stream.shutdown().await;
+    }
 
     if path == "/slow" {
         let delay = query

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use steadwright::{
     ActionOptions, Browser, ByRoleOptions, ClickOptions, GotoOptions, JsValue, LoadState,
-    MouseButton, ScreenshotFormat, ScreenshotOptions, UrlMatcher, ViewportSize, WaitForUrlOptions,
+    MouseButton, RequestFilter, ScreenshotFormat, ScreenshotOptions, UrlMatcher, ViewportSize,
+    WaitForFunctionOptions, WaitForUrlOptions,
 };
 use steadwright_cdp::transport::Incoming;
 use steadwright_cdp::{Transport, TransportError};
@@ -183,6 +184,110 @@ async fn goto_returns_response_and_updates_url() {
     assert!(response.ok);
     assert_eq!(response.url, url);
     assert_eq!(page.url(), url);
+    page.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_log_captures_api_bodies_failures_and_document_response() {
+    let Some(fixture) = Fixture::get().await else {
+        return;
+    };
+    let page = fixture.new_page().await.unwrap();
+    page.clear_requests();
+    let started = Instant::now();
+    let document = page
+        .goto(&fixture.url_a("/api.html"), GotoOptions::default())
+        .await
+        .unwrap()
+        .expect("fixture navigation should have a response");
+
+    page.wait_for_function(
+        "() => window.apiComplete === true",
+        Value::Null,
+        WaitForFunctionOptions::default(),
+    )
+    .await
+    .unwrap();
+    page.wait_for_load_state(LoadState::NetworkIdle, Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    let requests = page.requests(RequestFilter {
+        url_glob: Some("**/api/**".into()),
+        resource_types: Some(vec!["fetch".into(), "xhr".into()]),
+        since: Some(started),
+        limit: Some(20),
+    });
+    let request = |suffix: &str| {
+        requests
+            .iter()
+            .find(|request| request.url.ends_with(suffix))
+            .unwrap_or_else(|| panic!("missing {suffix} in {requests:#?}"))
+    };
+
+    let items = request("/api/items");
+    assert_eq!(items.method, "GET");
+    assert!(matches!(items.resource_type.as_str(), "xhr" | "fetch"));
+    let items_response = items.response().expect("items response");
+    assert_eq!(items_response.status, 200);
+    assert!(items_response.ok);
+    assert_eq!(
+        items_response.json().await.unwrap(),
+        json!({"items":[{"id":1,"name":"alpha"},{"id":2,"name":"beta"}]})
+    );
+
+    let echo = request("/api/echo");
+    assert_eq!(echo.method, "POST");
+    assert!(matches!(echo.resource_type.as_str(), "xhr" | "fetch"));
+    let echo_payload = json!({"message":"steadwright echo","count":2});
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            echo.post_data()
+                .await
+                .unwrap()
+                .as_deref()
+                .expect("echo post data")
+        )
+        .unwrap(),
+        echo_payload
+    );
+    let echo_response = echo.response().expect("echo response");
+    assert_eq!(echo_response.status, 200);
+    assert_eq!(echo_response.json().await.unwrap(), echo_payload);
+
+    let missing = request("/api/missing");
+    assert_eq!(missing.response().expect("404 response").status, 404);
+
+    let failed = request("/api/fail");
+    assert!(
+        failed.failure().is_some(),
+        "failed request did not record a failure: {failed:#?}"
+    );
+    let timing = failed.timing();
+    assert!(timing.start_time <= std::time::SystemTime::now());
+    assert!(
+        timing.duration_ms.is_some_and(|duration| duration >= 0.0),
+        "failed request did not record a duration: {timing:#?}"
+    );
+
+    assert!(
+        document
+            .text()
+            .await
+            .unwrap()
+            .contains("Network API fixture")
+    );
+
+    page.clear_requests();
+    assert!(
+        page.requests(RequestFilter {
+            url_glob: None,
+            resource_types: None,
+            since: None,
+            limit: None,
+        })
+        .is_empty()
+    );
     page.close().await.unwrap();
 }
 

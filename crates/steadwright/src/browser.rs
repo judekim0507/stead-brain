@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::input::InputState;
 use base64::Engine as _;
@@ -13,9 +13,9 @@ use tokio::sync::Notify;
 use crate::{
     CallArg, ConsoleMessage, DEFAULT_BOOTSTRAP_TIMEOUT, DEFAULT_NAVIGATION_TIMEOUT,
     DEFAULT_TIMEOUT, Deadline, DialogType, Error, GotoOptions, IntoTimeout, JsValue, Keyboard,
-    LoadState, Mouse, PageError, PageEvent, Request, Response, Result, ScreenshotFormat,
-    ScreenshotOptions, ScreenshotScale, Touchscreen, UrlMatcher, ViewportSize, WaitForUrlOptions,
-    World,
+    LoadState, Mouse, PageError, PageEvent, Request, RequestFilter, RequestTiming, Response,
+    Result, ScreenshotFormat, ScreenshotOptions, ScreenshotScale, Touchscreen, UrlMatcher,
+    ViewportSize, WaitForUrlOptions, World,
 };
 
 const UTILITY_WORLD: &str = "__steadwright";
@@ -194,14 +194,50 @@ struct PageState {
     default_navigation_timeout: Duration,
     viewport: Option<ViewportSize>,
     navigation_generation: u64,
-    inflight: HashSet<String>,
+    inflight: HashSet<NetworkKey>,
     last_network_activity: Instant,
-    loader_requests: HashMap<String, String>,
-    responses: HashMap<String, Response>,
-    failures: HashMap<String, String>,
+    loader_requests: HashMap<NetworkKey, NetworkKey>,
+    responses: HashMap<NetworkKey, Response>,
+    failures: HashMap<NetworkKey, String>,
+    active_requests: HashMap<NetworkKey, Request>,
     network_sequence: u64,
-    request_events: Vec<(u64, Request)>,
+    request_events: VecDeque<(u64, Request)>,
     response_events: Vec<(u64, Response)>,
+}
+
+type NetworkKey = (String, String);
+
+pub(crate) struct NetworkRequest {
+    page: Weak<PageInner>,
+    session_id: String,
+    request_id: String,
+    has_post_data: bool,
+    started_at: Instant,
+    start_time: SystemTime,
+    cdp_start_time: Option<f64>,
+    state: Mutex<NetworkRequestState>,
+    notify: Notify,
+}
+
+#[derive(Clone)]
+struct NetworkResponseData {
+    url: String,
+    status: u16,
+    ok: bool,
+    headers: HashMap<String, String>,
+    mime_type: String,
+    redirect: bool,
+}
+
+#[derive(Default)]
+struct NetworkRequestState {
+    response: Option<NetworkResponseData>,
+    failure: Option<String>,
+    finished: bool,
+    duration_ms: Option<f64>,
+    size: Option<u64>,
+    post_data_cache: Option<std::result::Result<Option<String>, String>>,
+    body_cache: Option<std::result::Result<Vec<u8>, String>>,
 }
 
 #[derive(Clone)]
@@ -742,8 +778,9 @@ impl Page {
                     loader_requests: HashMap::new(),
                     responses: HashMap::new(),
                     failures: HashMap::new(),
+                    active_requests: HashMap::new(),
                     network_sequence: 0,
-                    request_events: Vec::new(),
+                    request_events: VecDeque::new(),
                     response_events: Vec::new(),
                 }),
                 notify: Notify::new(),
@@ -1065,6 +1102,49 @@ impl Page {
                 .await
         }
     }
+
+    /// Returns recent requests captured from every frame and CDP session owned by this page.
+    ///
+    /// This request log is a steadwright extension; Playwright exposes request events instead.
+    pub fn requests(&self, filter: RequestFilter) -> Vec<Request> {
+        let resource_types = filter.resource_types.map(|types| {
+            types
+                .into_iter()
+                .map(|value| value.to_ascii_lowercase())
+                .collect::<HashSet<_>>()
+        });
+        let mut requests = self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .request_events
+            .iter()
+            .filter(|(_, request)| {
+                filter
+                    .url_glob
+                    .as_ref()
+                    .is_none_or(|glob| crate::types::glob_matches(glob, &request.url))
+                    && resource_types
+                        .as_ref()
+                        .is_none_or(|types| types.contains(&request.resource_type))
+                    && filter
+                        .since
+                        .is_none_or(|since| request.record.started_at >= since)
+            })
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>();
+        let limit = filter.limit.unwrap_or(500).min(500);
+        if requests.len() > limit {
+            requests.drain(..requests.len() - limit);
+        }
+        requests
+    }
+
+    pub fn clear_requests(&self) {
+        self.inner.state.lock().unwrap().request_events.clear();
+    }
+
     pub async fn set_viewport_size(&self, width: u32, height: u32) -> Result<()> {
         self.send_main(
             "Emulation.setDeviceMetricsOverride",
@@ -1195,12 +1275,10 @@ impl Page {
     }
     fn current_response(&self) -> Option<Response> {
         let s = self.inner.state.lock().unwrap();
-        let loader = s
-            .main_frame
-            .as_ref()
-            .and_then(|id| s.frames.get(id))
-            .and_then(|f| f.loader_id.as_ref())?;
-        let request = s.loader_requests.get(loader)?;
+        let frame = s.main_frame.as_ref().and_then(|id| s.frames.get(id))?;
+        let loader = frame.loader_id.as_ref()?;
+        let loader_key = (frame.owner_session.clone(), loader.clone());
+        let request = s.loader_requests.get(&loader_key)?;
         s.responses.get(request).cloned()
     }
 
@@ -1372,6 +1450,168 @@ impl Page {
             .send(method, params)
             .await
             .map_err(Into::into)
+    }
+}
+
+impl Request {
+    pub async fn post_data(&self) -> Result<Option<String>> {
+        if self.post_data.is_some() || !self.record.has_post_data {
+            return Ok(self.post_data.clone());
+        }
+        if let Some(cached) = self.record.state.lock().unwrap().post_data_cache.clone() {
+            return cached.map_err(Error::Network);
+        }
+        let page = Page {
+            inner: self.record.page.upgrade().ok_or(Error::TargetClosed)?,
+        };
+        let fetched = page
+            .send_session(
+                &self.record.session_id,
+                "Network.getRequestPostData",
+                json!({"requestId": self.record.request_id}),
+            )
+            .await
+            .map_err(network_command_error)
+            .and_then(|result| {
+                result
+                    .get("postData")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        Error::Network("Network.getRequestPostData returned no postData".into())
+                    })
+            });
+        let cached = fetched
+            .as_ref()
+            .map(|value| Some(value.clone()))
+            .map_err(ToString::to_string);
+        self.record.state.lock().unwrap().post_data_cache = Some(cached);
+        fetched.map(Some)
+    }
+
+    pub fn response(&self) -> Option<Response> {
+        self.record
+            .state
+            .lock()
+            .unwrap()
+            .response
+            .clone()
+            .map(|response| response_from_data(self, response))
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.record.state.lock().unwrap().failure.clone()
+    }
+
+    pub fn timing(&self) -> RequestTiming {
+        RequestTiming {
+            start_time: self.record.start_time,
+            duration_ms: self.record.state.lock().unwrap().duration_ms,
+        }
+    }
+}
+
+impl Response {
+    pub async fn body(&self) -> Result<Vec<u8>> {
+        if self.redirect {
+            return Err(Error::Network(
+                "Response body is unavailable for redirect responses".into(),
+            ));
+        }
+        let record = &self.request.record;
+        let page_inner = record.page.upgrade().ok_or(Error::TargetClosed)?;
+        loop {
+            // Subscribe before checking state so a completion or close event
+            // cannot land between the check and the wait.
+            let request_changed = record.notify.notified();
+            let page_changed = page_inner.notify.notified();
+            let status = {
+                let state = record.state.lock().unwrap();
+                if let Some(cached) = &state.body_cache {
+                    return cached.clone().map_err(Error::Network);
+                }
+                (state.finished, state.failure.clone())
+            };
+            if let Some(failure) = status.1 {
+                return Err(Error::Network(failure));
+            }
+            if status.0 {
+                break;
+            }
+            if page_inner.state.lock().unwrap().closed {
+                return Err(Error::TargetClosed);
+            }
+            tokio::select! {
+                _ = request_changed => {},
+                _ = page_changed => {},
+            }
+        }
+
+        let page = Page { inner: page_inner };
+        let fetched = page
+            .send_session(
+                &record.session_id,
+                "Network.getResponseBody",
+                json!({"requestId": record.request_id}),
+            )
+            .await
+            .map_err(network_command_error)
+            .and_then(decode_response_body);
+        let cached = fetched.as_ref().cloned().map_err(ToString::to_string);
+        record.state.lock().unwrap().body_cache = Some(cached);
+        fetched
+    }
+
+    pub async fn text(&self) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.body().await?).into_owned())
+    }
+
+    pub async fn json(&self) -> Result<Value> {
+        serde_json::from_slice(&self.body().await?)
+            .map_err(|error| Error::Network(error.to_string()))
+    }
+
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.headers
+    }
+
+    pub fn request(&self) -> Request {
+        (*self.request).clone()
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        self.request.record.state.lock().unwrap().size
+    }
+}
+
+fn decode_response_body(result: Value) -> Result<Vec<u8>> {
+    let body = result
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Network("Network.getResponseBody returned no body".into()))?;
+    if result
+        .get("base64Encoded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .map_err(|error| Error::Network(error.to_string()))
+    } else {
+        Ok(body.as_bytes().to_vec())
+    }
+}
+
+fn network_command_error(error: Error) -> Error {
+    match error {
+        Error::Protocol(steadwright_cdp::CdpError::Protocol { message, .. }) => {
+            let message = message
+                .split_once("): ")
+                .map_or(message.as_str(), |(_, detail)| detail)
+                .to_owned();
+            Error::Network(message)
+        }
+        error => error,
     }
 }
 
@@ -1783,7 +2023,11 @@ impl Frame {
             loop {
                 let status = {
                     let s = self.page.inner.state.lock().unwrap();
-                    let failure = loader.as_ref().and_then(|id| s.loader_requests.get(id)).and_then(|id| s.failures.get(id)).cloned();
+                    let failure = loader
+                        .as_ref()
+                        .and_then(|id| s.loader_requests.get(&(session.clone(), id.clone())))
+                        .and_then(|id| s.failures.get(id))
+                        .cloned();
                     let frame = s.frames.get(&self.id);
                     let committed = s.navigation_generation > before || loader.as_ref().is_some_and(|id| frame.and_then(|f| f.loader_id.as_ref()) == Some(id));
                     let loaded = match options.wait_until {
@@ -1802,7 +2046,7 @@ impl Frame {
         let s = self.page.inner.state.lock().unwrap();
         let response = loader
             .as_ref()
-            .and_then(|id| s.loader_requests.get(id))
+            .and_then(|id| s.loader_requests.get(&(session, id.clone())))
             .and_then(|id| s.responses.get(id))
             .cloned();
         Ok(response)
@@ -3055,11 +3299,12 @@ fn handle_page_event(page: &Page, session: &str, method: &str, params: &Value) {
             }
         }
         "Runtime.executionContextsCleared" => destroy_context(page, session, None),
-        "Network.requestWillBeSent" => handle_request(page, params),
-        "Network.responseReceived" => handle_response(page, params),
-        "Network.loadingFinished" => finish_request(page, params, None),
+        "Network.requestWillBeSent" => handle_request(page, session, params),
+        "Network.responseReceived" => handle_response(page, session, params),
+        "Network.loadingFinished" => finish_request(page, session, params, None),
         "Network.loadingFailed" => finish_request(
             page,
+            session,
             params,
             params.get("errorText").and_then(Value::as_str),
         ),
@@ -3145,7 +3390,7 @@ fn destroy_context(page: &Page, session: &str, context_id: Option<u64>) {
     page.inner.notify.notify_waiters();
 }
 
-fn handle_request(page: &Page, params: &Value) {
+fn handle_request(page: &Page, session: &str, params: &Value) {
     let Some(request_id) = params
         .get("requestId")
         .and_then(Value::as_str)
@@ -3153,6 +3398,7 @@ fn handle_request(page: &Page, params: &Value) {
     else {
         return;
     };
+    let key = (session.to_owned(), request_id.clone());
     let loader_id = params
         .get("loaderId")
         .and_then(Value::as_str)
@@ -3162,109 +3408,111 @@ fn handle_request(page: &Page, params: &Value) {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .to_owned();
-    let request = params.get("request");
+        .to_ascii_lowercase();
+    let Some(payload) = params.get("request") else {
+        return;
+    };
     let mut state = page.inner.state.lock().unwrap();
-    if let Some(request) = request {
+
+    let mut redirected_record = None;
+    if let (Some(redirected), Some(payload)) = (
+        state.active_requests.get(&key).cloned(),
+        params.get("redirectResponse"),
+    ) {
+        let data = response_data(payload, true);
+        let response = response_from_data(&redirected, data.clone());
+        {
+            let mut request_state = redirected.record.state.lock().unwrap();
+            request_state.response = Some(data);
+            request_state.finished = true;
+            request_state.duration_ms = event_duration_ms(&redirected.record, params);
+            request_state.size = encoded_data_length(payload);
+        }
+        state.responses.insert(key.clone(), response.clone());
         state.network_sequence += 1;
         let sequence = state.network_sequence;
-        let headers = request
-            .get("headers")
-            .and_then(Value::as_object)
-            .map(|headers| {
-                headers
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            value
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| value.to_string()),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        state.request_events.push((
-            sequence,
-            Request {
-                url: request
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                method: request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                headers,
-                post_data: request
-                    .get("postData")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            },
-        ));
-        if state.request_events.len() > 512 {
-            state.request_events.drain(..256);
+        state.response_events.push((sequence, response));
+        if state.response_events.len() > 512 {
+            state.response_events.drain(..256);
         }
+        state.inflight.remove(&key);
+        redirected_record = Some(redirected.record.clone());
     }
-    if resource_type == "Document" {
-        state.loader_requests.insert(loader_id, request_id.clone());
-    }
-    if resource_type != "WebSocket" && resource_type != "EventSource" {
-        state.inflight.insert(request_id);
-        state.last_network_activity = Instant::now();
-    }
-    drop(state);
-    page.inner.notify.notify_waiters();
-}
 
-fn handle_response(page: &Page, params: &Value) {
-    let Some(request_id) = params
-        .get("requestId")
+    let post_data = payload
+        .get("postData")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return;
-    };
-    let Some(response) = params.get("response") else {
-        return;
-    };
-    let status = response
-        .get("status")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0) as u16;
-    let headers = response
-        .get("headers")
-        .and_then(Value::as_object)
-        .map(|headers| {
-            headers
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        v.as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| v.to_string()),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let response = Response {
-        url: response
+        .map(str::to_owned);
+    let record = Arc::new(NetworkRequest {
+        page: Arc::downgrade(&page.inner),
+        session_id: session.to_owned(),
+        request_id,
+        has_post_data: post_data.is_some()
+            || payload
+                .get("hasPostData")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        started_at: Instant::now(),
+        start_time: event_wall_time(params),
+        cdp_start_time: params.get("timestamp").and_then(Value::as_f64),
+        state: Mutex::new(NetworkRequestState::default()),
+        notify: Notify::new(),
+    });
+    let request = Request {
+        url: payload
             .get("url")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        status,
-        ok: (200..400).contains(&status),
-        headers,
+        method: payload
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        resource_type: resource_type.clone(),
+        headers: network_headers(payload),
+        post_data,
+        record,
     };
+    state.active_requests.insert(key.clone(), request.clone());
+    state.network_sequence += 1;
+    let sequence = state.network_sequence;
+    state.request_events.push_back((sequence, request));
+    if state.request_events.len() > 500 {
+        state.request_events.pop_front();
+    }
+    if resource_type == "document" {
+        state
+            .loader_requests
+            .insert((session.to_owned(), loader_id), key.clone());
+    }
+    if resource_type != "websocket" && resource_type != "eventsource" {
+        state.inflight.insert(key);
+        state.last_network_activity = Instant::now();
+    }
+    drop(state);
+    if let Some(record) = redirected_record {
+        record.notify.notify_waiters();
+    }
+    page.inner.notify.notify_waiters();
+}
+
+fn handle_response(page: &Page, session: &str, params: &Value) {
+    let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(payload) = params.get("response") else {
+        return;
+    };
+    let key = (session.to_owned(), request_id.to_owned());
     let mut state = page.inner.state.lock().unwrap();
-    state.responses.insert(request_id, response.clone());
+    let Some(request) = state.active_requests.get(&key).cloned() else {
+        return;
+    };
+    let data = response_data(payload, false);
+    request.record.state.lock().unwrap().response = Some(data.clone());
+    let response = response_from_data(&request, data);
+    state.responses.insert(key, response.clone());
     state.network_sequence += 1;
     let sequence = state.network_sequence;
     state.response_events.push((sequence, response));
@@ -3275,20 +3523,109 @@ fn handle_response(page: &Page, params: &Value) {
     page.inner.notify.notify_waiters();
 }
 
-fn finish_request(page: &Page, params: &Value, failure: Option<&str>) {
+fn finish_request(page: &Page, session: &str, params: &Value, failure: Option<&str>) {
     let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
         return;
     };
+    let key = (session.to_owned(), request_id.to_owned());
     let mut state = page.inner.state.lock().unwrap();
-    state.inflight.remove(request_id);
+    state.inflight.remove(&key);
     state.last_network_activity = Instant::now();
     if let Some(failure) = failure {
-        state
-            .failures
-            .insert(request_id.to_owned(), failure.to_owned());
+        state.failures.insert(key.clone(), failure.to_owned());
+    }
+    let request = state.active_requests.remove(&key);
+    if let Some(request) = &request {
+        let mut request_state = request.record.state.lock().unwrap();
+        request_state.finished = true;
+        request_state.failure = failure.map(str::to_owned);
+        request_state.duration_ms = event_duration_ms(&request.record, params);
+        request_state.size = params
+            .get("encodedDataLength")
+            .and_then(Value::as_f64)
+            .map(|size| size.max(0.0) as u64);
     }
     drop(state);
+    if let Some(request) = request {
+        request.record.notify.notify_waiters();
+    }
     page.inner.notify.notify_waiters();
+}
+
+fn network_headers(payload: &Value) -> HashMap<String, String> {
+    payload
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn response_data(payload: &Value, redirect: bool) -> NetworkResponseData {
+    let status = payload.get("status").and_then(Value::as_f64).unwrap_or(0.0) as u16;
+    NetworkResponseData {
+        url: payload
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        status,
+        ok: (200..400).contains(&status),
+        headers: network_headers(payload),
+        mime_type: payload
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        redirect,
+    }
+}
+
+fn response_from_data(request: &Request, data: NetworkResponseData) -> Response {
+    Response {
+        url: data.url,
+        status: data.status,
+        ok: data.ok,
+        headers: data.headers,
+        mime_type: data.mime_type,
+        request: Box::new(request.clone()),
+        redirect: data.redirect,
+    }
+}
+
+fn event_wall_time(params: &Value) -> SystemTime {
+    let Some(seconds) = params.get("wallTime").and_then(Value::as_f64) else {
+        return SystemTime::now();
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return SystemTime::now();
+    }
+    UNIX_EPOCH + Duration::from_secs_f64(seconds)
+}
+
+fn event_duration_ms(request: &NetworkRequest, params: &Value) -> Option<f64> {
+    let finished = params.get("timestamp").and_then(Value::as_f64)?;
+    let started = request.cdp_start_time?;
+    Some(((finished - started) * 1_000.0).max(0.0))
+}
+
+fn encoded_data_length(payload: &Value) -> Option<u64> {
+    payload
+        .get("encodedDataLength")
+        .and_then(Value::as_f64)
+        .map(|size| size.max(0.0) as u64)
 }
 
 fn handle_dialog(page: &Page, session: &str, params: &Value) {

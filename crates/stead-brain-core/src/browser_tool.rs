@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -19,8 +19,9 @@ use steadwright::{
     ActionOptions, AriaSnapshotOptions, Browser, BrowserContext, ByRoleOptions, CallArg, Dialog,
     DialogType, Download, ElementHandle, FileChooser, Frame, FrameLocator, GotoOptions, JsHandle,
     Keyboard, LoadState, Locator, LocatorFilter, Mouse, MouseButton, Page, PageEvent, Point,
-    Polling, Response, ScreenshotFormat, ScreenshotOptions, SelectOptionValue, TextMatch,
-    UrlMatcher, WaitForFunctionOptions, WaitForOptions, WaitForSelectorState, WaitForUrlOptions,
+    Polling, Request, RequestFilter, Response, ScreenshotFormat, ScreenshotOptions,
+    SelectOptionValue, TextMatch, UrlMatcher, WaitForFunctionOptions, WaitForOptions,
+    WaitForSelectorState, WaitForUrlOptions,
 };
 use steadwright_cdp::transport::Incoming;
 use steadwright_cdp::{
@@ -31,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::BrowserToolBridge;
 
-const TOOL_DESCRIPTION: &str = "Run Playwright JavaScript against the user's browser, with an optional short step title shown to the user. Globals: page (current tab), context, browser, state (persists across calls), console. Top-level await and return are supported. Default timeouts: actions 5s, navigation 60s.";
+const TOOL_DESCRIPTION: &str = "Run Playwright JavaScript against the user's browser, with an optional short step title shown to the user. Globals: page (current tab), context, browser, state (persists across calls), console. Top-level await and return are supported. Default timeouts: actions 5s, navigation 60s. page.requests({url, withBodies}) lists recent network requests; response.json() reads a body.";
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 32 * 1024;
 const MAX_LOG_BYTES: usize = 16 * 1024;
@@ -39,6 +40,7 @@ const MAX_IMAGES: usize = 4;
 const MEMORY_LIMIT: usize = 32 * 1024 * 1024;
 const STACK_LIMIT: usize = 1024 * 1024;
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(120);
+const BODY_PREVIEW_LIMIT: usize = 2 * 1024;
 const RAW_CDP_ID_BASE: u64 = 8_000_000_000_000_000;
 const UNAVAILABLE: &str = "Browser control is unavailable: stead-brain was not launched by Stead.";
 const PHASE_6_REQUIRED: &str = "Credential fill requires the Phase 6 browser build.";
@@ -55,7 +57,8 @@ const BOOTSTRAP: &str = r#"
     'first', 'last', 'nth', 'filter', 'and', 'or', 'contentFrame', 'mainFrame',
     'contexts', 'pages', 'url', 'frames', 'viewportSize', 'isClosed',
     'setDefaultTimeout', 'setDefaultNavigationTimeout', 'name', 'isDetached',
-    'parentFrame', 'childFrames', 'status', 'ok', 'headers', 'asElement',
+    'parentFrame', 'childFrames', 'status', 'ok', 'headers', 'method',
+    'resourceType', 'response', 'failure', 'timing', 'request', 'asElement',
     'isMultiple', 'element', 'suggestedFilename', 'type', 'message', 'defaultValue'
   ]);
   const encode = value => JSON.stringify(value, (_key, item) => {
@@ -477,6 +480,7 @@ enum SteadwrightObject {
     FrameLocator(DescribedFrameLocator),
     JsHandle(JsHandle),
     ElementHandle(ElementHandle),
+    Request(Request),
     Response(Response),
     Dialog(Dialog),
     FileChooser(FileChooser),
@@ -524,6 +528,7 @@ impl SteadwrightObject {
             Self::FrameLocator(_) => "FrameLocator",
             Self::JsHandle(_) => "JSHandle",
             Self::ElementHandle(_) => "ElementHandle",
+            Self::Request(_) => "Request",
             Self::Response(_) => "Response",
             Self::Dialog(_) => "Dialog",
             Self::FileChooser(_) => "FileChooser",
@@ -543,6 +548,7 @@ impl SteadwrightObject {
             Self::FrameLocator(_) => "frameLocator",
             Self::JsHandle(_) => "jsHandle",
             Self::ElementHandle(_) => "elementHandle",
+            Self::Request(_) => "request",
             Self::Response(_) => "response",
             Self::Dialog(_) => "dialog",
             Self::FileChooser(_) => "fileChooser",
@@ -870,11 +876,34 @@ impl ExecutionHost {
                         .collect(),
                 ));
             }
+            (SteadwrightObject::Request(request), "url") => return Ok(json!(request.url)),
+            (SteadwrightObject::Request(request), "method") => return Ok(json!(request.method)),
+            (SteadwrightObject::Request(request), "resourceType") => {
+                return Ok(json!(request.resource_type));
+            }
+            (SteadwrightObject::Request(request), "headers") => {
+                return Ok(json!(request.headers));
+            }
+            (SteadwrightObject::Request(request), "response") => {
+                return Ok(match request.response() {
+                    Some(response) => registry.reference(SteadwrightObject::Response(response)),
+                    None => Value::Null,
+                });
+            }
+            (SteadwrightObject::Request(request), "failure") => {
+                return Ok(json!(request.failure()));
+            }
+            (SteadwrightObject::Request(request), "timing") => {
+                return Ok(request_timing_value(request));
+            }
             (SteadwrightObject::Response(response), "url") => return Ok(json!(response.url)),
             (SteadwrightObject::Response(response), "status") => return Ok(json!(response.status)),
             (SteadwrightObject::Response(response), "ok") => return Ok(json!(response.ok)),
             (SteadwrightObject::Response(response), "headers") => {
                 return Ok(json!(response.headers));
+            }
+            (SteadwrightObject::Response(response), "request") => {
+                return Ok(registry.reference(SteadwrightObject::Request(response.request())));
             }
             (SteadwrightObject::JsHandle(handle), "asElement") => {
                 return Ok(match handle.as_element() {
@@ -1141,11 +1170,29 @@ impl ExecutionHost {
                 )),
                 _ => Err(DispatchError::unknown(&receiver, method)),
             },
+            SteadwrightObject::Request(request) => match method {
+                "url" => Ok(json!(request.url)),
+                "method" => Ok(json!(request.method)),
+                "resourceType" => Ok(json!(request.resource_type)),
+                "headers" => Ok(json!(request.headers)),
+                "postData" => Ok(json!(request.post_data().await?)),
+                "response" => match request.response() {
+                    Some(response) => self.ref_value(SteadwrightObject::Response(response)),
+                    None => Ok(Value::Null),
+                },
+                "failure" => Ok(json!(request.failure())),
+                "timing" => Ok(request_timing_value(&request)),
+                _ => Err(DispatchError::unknown(&receiver, method)),
+            },
             SteadwrightObject::Response(response) => match method {
                 "url" => Ok(json!(response.url)),
                 "status" => Ok(json!(response.status)),
                 "ok" => Ok(json!(response.ok)),
                 "headers" => Ok(json!(response.headers)),
+                "text" => Ok(json!(response.text().await?)),
+                "json" => Ok(response.json().await?),
+                "body" => Ok(bytes_value(response.body().await?)),
+                "request" => self.ref_value(SteadwrightObject::Request(response.request())),
                 _ => Err(DispatchError::unknown(&receiver, method)),
             },
             SteadwrightObject::Dialog(dialog) => match method {
@@ -1315,6 +1362,20 @@ impl ExecutionHost {
                     .await?;
                 self.ref_value(SteadwrightObject::Response(response))
             }
+            "requests" => {
+                let (filter, with_bodies) = request_filter(arg(&args, 0))?;
+                let mut summaries = Vec::new();
+                for request in page.requests(filter) {
+                    summaries.push(request_summary_value(
+                        request_summary_input(&request, with_bodies).await,
+                    ));
+                }
+                Ok(Value::Array(summaries))
+            }
+            "clearRequests" => {
+                page.clear_requests();
+                Ok(Value::Null)
+            }
             "waitForRequest" => {
                 let request = page
                     .wait_for_request(
@@ -1322,9 +1383,7 @@ impl ExecutionHost {
                         timeout_from(arg(&args, 1)),
                     )
                     .await?;
-                Ok(
-                    json!({"url":request.url,"method":request.method,"headers":request.headers,"postData":request.post_data}),
-                )
+                self.ref_value(SteadwrightObject::Request(request))
             }
             "waitForEvent" => {
                 let event = page
@@ -1916,6 +1975,172 @@ struct DescribedTarget {
     frame_token: String,
 }
 
+struct RequestSummaryInput {
+    method: String,
+    url: String,
+    status: Option<u16>,
+    resource_type: String,
+    mime_type: Option<String>,
+    size: Option<u64>,
+    duration_ms: Option<f64>,
+    ok: bool,
+    body_preview: Option<String>,
+}
+
+async fn request_summary_input(request: &Request, with_bodies: bool) -> RequestSummaryInput {
+    let response = request.response();
+    let timing = request.timing();
+    let body_preview = if with_bodies
+        && timing.duration_ms.is_some()
+        && (request.resource_type.eq_ignore_ascii_case("xhr")
+            || request.resource_type.eq_ignore_ascii_case("fetch"))
+    {
+        match response.as_ref() {
+            Some(response) if is_textual_mime_type(&response.mime_type) => response
+                .text()
+                .await
+                .ok()
+                .map(|body| preview_text(&body, &response.mime_type)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    RequestSummaryInput {
+        method: request.method.clone(),
+        url: request.url.clone(),
+        status: response.as_ref().map(|response| response.status),
+        resource_type: request.resource_type.clone(),
+        mime_type: response.as_ref().map(|response| response.mime_type.clone()),
+        size: response.as_ref().and_then(Response::size),
+        duration_ms: timing.duration_ms,
+        ok: response.as_ref().is_some_and(|response| response.ok),
+        body_preview,
+    }
+}
+
+fn request_summary_value(summary: RequestSummaryInput) -> Value {
+    let mut value = json!({
+        "method": summary.method,
+        "url": summary.url,
+        "status": summary.status,
+        "resourceType": summary.resource_type,
+        "mimeType": summary.mime_type,
+        "size": summary.size,
+        "durationMs": summary.duration_ms,
+        "ok": summary.ok,
+    });
+    if let Some(body_preview) = summary.body_preview {
+        value
+            .as_object_mut()
+            .expect("request summary is an object")
+            .insert("bodyPreview".into(), json!(body_preview));
+    }
+    value
+}
+
+fn request_filter(options: Option<&Value>) -> Result<(RequestFilter, bool), DispatchError> {
+    let Some(options) = options else {
+        return Ok((RequestFilter::default(), false));
+    };
+    let object = options
+        .as_object()
+        .ok_or_else(|| DispatchError::ordinary("page.requests options must be an object"))?;
+    let url_glob = object
+        .get("url")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| DispatchError::ordinary("page.requests url must be a string"))
+        })
+        .transpose()?;
+    let resource_types = object
+        .get("resourceTypes")
+        .map(|value| {
+            let values = value.as_array().ok_or_else(|| {
+                DispatchError::ordinary("page.requests resourceTypes must be an array")
+            })?;
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        DispatchError::ordinary(
+                            "page.requests resourceTypes entries must be strings",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let limit = object
+        .get("limit")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    DispatchError::ordinary("page.requests limit must be a non-negative integer")
+                })
+        })
+        .transpose()?;
+    let with_bodies = object
+        .get("withBodies")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                DispatchError::ordinary("page.requests withBodies must be a boolean")
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    Ok((
+        RequestFilter {
+            url_glob,
+            resource_types,
+            since: None,
+            limit,
+        },
+        with_bodies,
+    ))
+}
+
+fn request_timing_value(request: &Request) -> Value {
+    let timing = request.timing();
+    let start_time = timing
+        .start_time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64() * 1_000.0)
+        .unwrap_or_else(|error| -(error.duration().as_secs_f64() * 1_000.0));
+    json!({"startTime": start_time, "durationMs": timing.duration_ms})
+}
+
+fn bytes_value(bytes: Vec<u8>) -> Value {
+    json!({
+        "__sw_bytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+fn is_textual_mime_type(mime_type: &str) -> bool {
+    let mime_type = mime_type.to_ascii_lowercase();
+    mime_type.starts_with("text/")
+        || mime_type.contains("json")
+        || mime_type.contains("javascript")
+        || mime_type.contains("xml")
+        || mime_type.contains("x-www-form-urlencoded")
+}
+
+fn preview_text(body: &str, mime_type: &str) -> String {
+    let pretty = if mime_type.to_ascii_lowercase().contains("json") {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+    } else {
+        None
+    };
+    let body = pretty.as_deref().unwrap_or(body);
+    body[..floor_char_boundary(body, BODY_PREVIEW_LIMIT)].to_owned()
+}
+
 /// The browser identifies a credential by the opaque `handle` returned from
 /// `stead.credentials.list()`. Accept the whole credential object or the
 /// bare handle string.
@@ -2434,6 +2659,7 @@ enum OperationTarget<'a> {
     FrameLocator,
     JsHandle,
     ElementHandle,
+    Request,
     Response,
     Dialog,
     FileChooser,
@@ -2453,6 +2679,7 @@ fn operation_target(receiver: Option<&SteadwrightObject>) -> OperationTarget<'_>
         Some(SteadwrightObject::FrameLocator(_)) => OperationTarget::FrameLocator,
         Some(SteadwrightObject::JsHandle(_)) => OperationTarget::JsHandle,
         Some(SteadwrightObject::ElementHandle(_)) => OperationTarget::ElementHandle,
+        Some(SteadwrightObject::Request(_)) => OperationTarget::Request,
         Some(SteadwrightObject::Response(_)) => OperationTarget::Response,
         Some(SteadwrightObject::Dialog(_)) => OperationTarget::Dialog,
         Some(SteadwrightObject::FileChooser(_)) => OperationTarget::FileChooser,
@@ -2575,7 +2802,10 @@ fn operation_message(target: OperationTarget<'_>, method: &str, args: &Value) ->
             "wheel" => "scroll".to_string(),
             _ => return None,
         },
-        OperationTarget::FrameLocator | OperationTarget::Response | OperationTarget::Download => {
+        OperationTarget::FrameLocator
+        | OperationTarget::Request
+        | OperationTarget::Response
+        | OperationTarget::Download => {
             return None;
         }
     };
@@ -3219,6 +3449,51 @@ mod tests {
         })));
         assert!(options.interactive);
         assert!(options.diff);
+    }
+
+    #[test]
+    fn network_request_summaries_are_plain_objects_with_optional_body_previews() {
+        let summary = request_summary_value(RequestSummaryInput {
+            method: "POST".into(),
+            url: "https://example.test/api/items".into(),
+            status: Some(201),
+            resource_type: "fetch".into(),
+            mime_type: Some("application/json".into()),
+            size: Some(48),
+            duration_ms: Some(12.5),
+            ok: true,
+            body_preview: Some("{\n  \"created\": true\n}".into()),
+        });
+        assert_eq!(
+            summary,
+            json!({
+                "method": "POST",
+                "url": "https://example.test/api/items",
+                "status": 201,
+                "resourceType": "fetch",
+                "mimeType": "application/json",
+                "size": 48,
+                "durationMs": 12.5,
+                "ok": true,
+                "bodyPreview": "{\n  \"created\": true\n}",
+            })
+        );
+
+        let failed = request_summary_value(RequestSummaryInput {
+            method: "GET".into(),
+            url: "https://example.test/unreachable".into(),
+            status: None,
+            resource_type: "fetch".into(),
+            mime_type: None,
+            size: None,
+            duration_ms: Some(3.0),
+            ok: false,
+            body_preview: None,
+        });
+        assert_eq!(failed["status"], Value::Null);
+        assert_eq!(failed["mimeType"], Value::Null);
+        assert_eq!(failed["size"], Value::Null);
+        assert!(failed.get("bodyPreview").is_none());
     }
 
     #[test]
