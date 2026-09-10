@@ -320,3 +320,20 @@ Known follow-ups:
 - Provider/effort selection is per browser profile; a fresh profile defaults to Claude.
 - The two branding patches at the end of `series` remain unapplied by quilt
   (one is malformed) and need regenerating.
+
+## Status — 2026-09-09, later: closing the gap with Aside
+
+- Substrate timing on Apple's configurator (examples/timing.rs): ariaSnapshot 30–90 ms
+  for 41 KB, count 24 ms; real Playwright fails the same label-covered radio clicks.
+- Defaults: 5 s actions / 60 s navigation (Playwright MCP parity).
+- `ariaSnapshot({interactive: true})` is ~71% smaller; `{diff: true}` returns a
+  unified diff against the previous snapshot of that frame. The model adopts
+  them unprompted beyond one prompt sentence.
+- browser_exec output is plain text; optional `title` names the step; tool_status
+  events carry the script and an output preview; the sidebar renders each
+  execution as a code card (title, code, output) live and from history.
+- CDP gate: Full access bypasses, Read only denies, Ask parks the command until
+  the sidebar prompt is answered.
+- Measured: "which sizes and chips" lookup on apple.com/ca in 14 s, one call.
+  MacBook configuration at Sol Medium before the snapshot work: 20 calls / ~156 s;
+  re-measure with interactive+diff snapshots.
