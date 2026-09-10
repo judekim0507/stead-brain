@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::BrowserToolBridge;
 
-const TOOL_DESCRIPTION: &str = "Run Playwright JavaScript against the user's browser. Globals: page (current tab), context, browser, state (persists across calls), console. Top-level await and return are supported.";
+const TOOL_DESCRIPTION: &str = "Run Playwright JavaScript against the user's browser. Globals: page (current tab), context, browser, state (persists across calls), console. Top-level await and return are supported. Default timeouts: actions 5s, navigation 60s.";
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 32 * 1024;
 const MAX_LOG_BYTES: usize = 16 * 1024;

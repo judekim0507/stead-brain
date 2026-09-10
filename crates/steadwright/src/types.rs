@@ -7,7 +7,14 @@ use crate::ElementHandle;
 use crate::JsHandle;
 use serde_json::Value;
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-action timeout. Playwright's library default is 30 s, but an
+/// agent pays the full timeout on every wrong guess, so this follows
+/// Playwright MCP's 5 s action default instead.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default navigation timeout (Playwright MCP uses 60 s).
+pub const DEFAULT_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Internal bootstrap waits (connect, new page attach).
+pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub trait IntoTimeout {
     fn into_timeout(self) -> Duration;

@@ -11,10 +11,11 @@ use steadwright_cdp::{Connection, Event, Session, Transport, WebSocketTransport}
 use tokio::sync::Notify;
 
 use crate::{
-    CallArg, ConsoleMessage, DEFAULT_TIMEOUT, Deadline, DialogType, Error, GotoOptions,
-    IntoTimeout, JsValue, Keyboard, LoadState, Mouse, PageError, PageEvent, Request, Response,
-    Result, ScreenshotFormat, ScreenshotOptions, ScreenshotScale, Touchscreen, UrlMatcher,
-    ViewportSize, WaitForUrlOptions, World,
+    CallArg, ConsoleMessage, DEFAULT_BOOTSTRAP_TIMEOUT, DEFAULT_NAVIGATION_TIMEOUT,
+    DEFAULT_TIMEOUT, Deadline, DialogType, Error, GotoOptions, IntoTimeout, JsValue, Keyboard,
+    LoadState, Mouse, PageError, PageEvent, Request, Response, Result, ScreenshotFormat,
+    ScreenshotOptions, ScreenshotScale, Touchscreen, UrlMatcher, ViewportSize, WaitForUrlOptions,
+    World,
 };
 
 const UTILITY_WORLD: &str = "__steadwright";
@@ -416,7 +417,7 @@ impl Browser {
                     .map(str::to_owned)
             })
             .collect();
-        let deadline = Deadline::new(DEFAULT_TIMEOUT);
+        let deadline = Deadline::new(DEFAULT_BOOTSTRAP_TIMEOUT);
         deadline
             .run("browser.connect", async {
                 for target in page_targets {
@@ -580,7 +581,7 @@ impl BrowserContext {
             return Ok(None);
         };
 
-        let deadline = Deadline::new(DEFAULT_TIMEOUT);
+        let deadline = Deadline::new(DEFAULT_BOOTSTRAP_TIMEOUT);
         loop {
             let retry = {
                 let mut targets = browser.targets.write().unwrap();
@@ -647,7 +648,7 @@ impl BrowserContext {
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Protocol(steadwright_cdp::CdpError::Disconnected))?
             .to_owned();
-        let deadline = Deadline::new(DEFAULT_TIMEOUT);
+        let deadline = Deadline::new(DEFAULT_BOOTSTRAP_TIMEOUT);
         deadline
             .run("context.new_page", async {
                 loop {
@@ -731,7 +732,7 @@ impl Page {
                     initialization_error: None,
                     closed: false,
                     default_timeout: DEFAULT_TIMEOUT,
-                    default_navigation_timeout: DEFAULT_TIMEOUT,
+                    default_navigation_timeout: DEFAULT_NAVIGATION_TIMEOUT,
                     viewport: None,
                     navigation_generation: 0,
                     inflight: HashSet::new(),
