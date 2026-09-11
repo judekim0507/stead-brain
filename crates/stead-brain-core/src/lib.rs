@@ -669,6 +669,7 @@ impl AgentTool for AskUserTool {
                     status: "waiting_for_user".to_string(),
                     message: Some(prompt.to_string()),
                     detail: None,
+                    name: None,
                 }),
             ),
         );
@@ -1307,6 +1308,7 @@ impl BrainCore {
                             status: "cancelled".to_string(),
                             message: None,
                             detail: None,
+                            name: None,
                         }),
                     ),
                 );
@@ -1412,6 +1414,7 @@ impl BrainCore {
                     status: if ok { "completed" } else { "failed" }.to_string(),
                     message: error,
                     detail: None,
+                    name: None,
                 }),
             )]);
         }
@@ -1446,6 +1449,7 @@ impl BrainCore {
                 .to_string(),
                 message: result.result.error,
                 detail: None,
+                name: None,
             }),
         )])
     }
@@ -1477,6 +1481,7 @@ impl BrainCore {
                 status: status.to_string(),
                 message,
                 detail: None,
+                name: None,
             }),
         )])
     }
@@ -1921,21 +1926,19 @@ fn turn_event_listener(
                     tool_name,
                     args,
                 } => {
-                    // browser_exec: the model's step title (if any) becomes the
-                    // message and the script travels as detail so the UI can
-                    // show the code card while it runs.
-                    let (message, detail) = if tool_name == "browser_exec" {
-                        let title = args
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|title| !title.is_empty())
-                            .map(str::to_owned);
-                        let code = args.get("code").and_then(Value::as_str).map(str::to_owned);
-                        (title.or(Some(tool_name)), code)
-                    } else {
-                        (Some(tool_name), None)
-                    };
+                    // The UI renders every tool call as a card: `message` is the
+                    // human title (browser_exec's optional `title`, else the tool
+                    // name), `detail` the code or arguments to show while running.
+                    let title = (tool_name == "browser_exec")
+                        .then(|| {
+                            args.get("title")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|title| !title.is_empty())
+                                .map(str::to_owned)
+                        })
+                        .flatten();
+                    let detail = tool_step_detail(&tool_name, &args);
                     emit_response(
                         &tx,
                         ResponseEnvelope::session_event(
@@ -1944,8 +1947,9 @@ fn turn_event_listener(
                             BrainEvent::ToolStatus(ToolStatus {
                                 tool_call_id,
                                 status: "running".to_string(),
-                                message,
+                                message: Some(title.unwrap_or_else(|| tool_name.clone())),
                                 detail,
+                                name: Some(tool_name),
                             }),
                         ),
                     );
@@ -1956,14 +1960,11 @@ fn turn_event_listener(
                     result,
                     is_error,
                 } => {
-                    let detail = (tool_name == "browser_exec").then(|| {
-                        let text = user_blocks_to_text(&result.content);
-                        let mut preview: String = text.chars().take(1200).collect();
-                        if preview.chars().count() < text.chars().count() {
-                            preview.push_str("\n…");
-                        }
-                        preview
-                    });
+                    let text = user_blocks_to_text(&result.content);
+                    let mut preview: String = text.chars().take(1200).collect();
+                    if preview.chars().count() < text.chars().count() {
+                        preview.push_str("\n…");
+                    }
                     emit_response(
                         &tx,
                         ResponseEnvelope::session_event(
@@ -1972,8 +1973,9 @@ fn turn_event_listener(
                             BrainEvent::ToolStatus(ToolStatus {
                                 tool_call_id,
                                 status: if is_error { "failed" } else { "completed" }.to_string(),
-                                message: Some(tool_name),
-                                detail,
+                                message: Some(tool_name.clone()),
+                                detail: (!preview.trim().is_empty()).then_some(preview),
+                                name: Some(tool_name),
                             }),
                         ),
                     );
@@ -2486,6 +2488,40 @@ fn user_content_to_text(content: &pie_ai::UserContent) -> String {
     }
 }
 
+/// What the sidebar shows inside a tool card while the call runs: the code or
+/// command for code-like tools, a compact argument summary for the rest.
+fn tool_step_detail(tool_name: &str, args: &Value) -> Option<String> {
+    let field = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
+    match tool_name {
+        "browser_exec" => field("code"),
+        "bash" => field("command"),
+        "read" | "ls" | "find" => field("path").or_else(|| field("pattern")),
+        "grep" => Some(format!(
+            "{}{}",
+            field("pattern").unwrap_or_default(),
+            field("path")
+                .map(|p| format!("  in {p}"))
+                .unwrap_or_default()
+        )),
+        "write" => Some(format!(
+            "// {}\n{}",
+            field("path").unwrap_or_default(),
+            field("content").unwrap_or_default()
+        )),
+        "edit" => Some(format!(
+            "// {}\n- {}\n+ {}",
+            field("path").unwrap_or_default(),
+            field("old_string").unwrap_or_default(),
+            field("new_string").unwrap_or_default()
+        )),
+        "WebFetch" => field("url"),
+        "Skill" => field("name"),
+        "memory" => field("action").or_else(|| field("query")),
+        _ => None,
+    }
+    .filter(|detail| !detail.trim().is_empty())
+}
+
 fn user_blocks_to_text(blocks: &[pie_ai::UserContentBlock]) -> String {
     blocks
         .iter()
@@ -2610,6 +2646,7 @@ fn control_plane_prompt_hook(
                             status: "waiting_for_user".to_string(),
                             message: Some(prompt.reason.clone()),
                             detail: None,
+                            name: None,
                         }),
                     ),
                 );

@@ -297,6 +297,10 @@ pub struct ToolStatus {
     /// running and a trimmed output preview on completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Tool name, so the UI can pick an icon and a code language even when
+    /// `message` carries a human title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

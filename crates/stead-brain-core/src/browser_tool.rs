@@ -692,6 +692,7 @@ impl BrowserEventSink {
                 status: status.to_string(),
                 message: Some(message.to_string()),
                 detail: None,
+                name: None,
             }),
         ));
     }
@@ -3554,12 +3555,14 @@ mod tests {
                     status: "running".into(),
                     message: Some("Opening the order page".into()),
                     detail: None,
+                    name: None,
                 },
                 ToolStatus {
                     tool_call_id: "title-call".into(),
                     status: "failed".into(),
                     message: Some("Opening the order page".into()),
                     detail: None,
+                    name: None,
                 },
             ]
         );
@@ -3749,36 +3752,42 @@ mod tests {
                     status: "running".into(),
                     message: Some("browser_exec".into()),
                     detail: None,
+                    name: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:0".into(),
                     status: "running".into(),
                     message: Some("goto https://www.apple.com/ca/store".into()),
                     detail: None,
+                    name: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:0".into(),
                     status: "completed".into(),
                     message: Some("goto https://www.apple.com/ca/store".into()),
                     detail: None,
+                    name: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:1".into(),
                     status: "running".into(),
                     message: Some("click getByRole('button', { name: 'Go' })".into()),
                     detail: None,
+                    name: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call:op:1".into(),
                     status: "completed".into(),
                     message: Some("click getByRole('button', { name: 'Go' })".into()),
                     detail: None,
+                    name: None,
                 },
                 ToolStatus {
                     tool_call_id: "parent-call".into(),
                     status: "completed".into(),
                     message: Some("browser_exec".into()),
                     detail: None,
+                    name: None,
                 },
             ]
         );
