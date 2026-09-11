@@ -1,0 +1,7 @@
+<!doctype html><html><body>
+<div id="late-root"></div><button id="late-enabled" disabled>Enable later</button><button id="remove">Remove me</button>
+<script>
+  setTimeout(() => document.querySelector('#late-root').innerHTML = '<button id="late">Late button</button>', 500);
+  setTimeout(() => document.querySelector('#late-enabled').disabled = false, 500);
+  document.querySelector('#remove').addEventListener('click', event => event.currentTarget.remove());
+</script></body></html>

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Network API fixtures</title>
+  </head>
+  <body>
+    <main>
+      <h1>Network API fixture</h1>
+    </main>
+    <script>
+      window.apiComplete = false;
+
+      const postEcho = () => new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('POST', '/api/echo');
+        request.setRequestHeader('Content-Type', 'application/json');
+        request.onload = () => resolve(request.responseText);
+        request.onerror = () => reject(new Error('echo request failed'));
+        request.send(JSON.stringify({message: 'steadwright echo', count: 2}));
+      });
+
+      Promise.allSettled([
+        fetch('/api/items').then(response => response.json()),
+        postEcho(),
+        fetch('/api/missing').then(response => response.text()),
+        fetch('/api/fail').catch(() => null),
+      ]).then(() => {
+        window.apiComplete = true;
+      });
+    </script>
+  </body>
+</html>

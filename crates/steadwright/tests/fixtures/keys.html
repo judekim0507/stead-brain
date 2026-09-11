@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Keyboard fixture</title>
+  </head>
+  <body>
+    <input id="target" autofocus>
+    <pre id="log"></pre>
+    <script>
+      const target = document.querySelector('#target');
+      const log = document.querySelector('#log');
+      const record = event => {
+        log.textContent += [event.type, event.key, event.code, event.keyCode].join('|') + '\n';
+      };
+      for (const type of ['keydown', 'keypress', 'keyup', 'input'])
+        target.addEventListener(type, record);
+    </script>
+  </body>
+</html>
