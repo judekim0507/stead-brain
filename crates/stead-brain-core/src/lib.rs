@@ -2072,7 +2072,7 @@ async fn generate_chat_title(
     // Reasoning models spend output tokens on thinking and reject
     // `temperature`; keep thinking minimal and leave room for the answer.
     options.base.max_tokens = Some(96);
-    options.reasoning = Some(ThinkingLevel::Minimal);
+    options.reasoning = Some(pie_ai::ThinkingLevel::Minimal);
     let stream_fn = stead_stream_fn(auth);
     let Some(message) = stream_fn(&model, &context, Some(&options)).result().await else {
         return Ok(None);
