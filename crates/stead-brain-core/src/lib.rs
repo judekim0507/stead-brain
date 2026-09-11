@@ -1217,6 +1217,24 @@ impl BrainCore {
                 "Codex is not connected. Import or reconnect Codex authentication.".to_string(),
             ));
         }
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.sessions.root_dir().join("brain.log"))
+            {
+                let _ = writeln!(
+                    file,
+                    "{} turn: session={} title={:?} model={}/{}",
+                    Utc::now().to_rfc3339(),
+                    session_info.id,
+                    session_info.title,
+                    model.provider.0,
+                    model.id
+                );
+            }
+        }
         if session_info.title == "New chat" {
             self.spawn_title_generation(
                 request_id.clone(),
@@ -1378,13 +1396,49 @@ impl BrainCore {
     ) {
         let auth = self.auth.clone();
         let sessions = self.sessions.clone();
+        let log_path = self.sessions.root_dir().join("brain.log");
         tokio::spawn(async move {
-            let Ok(Some(title)) = generate_chat_title(model, auth, &prompt).await else {
-                return;
+            let model_label = format!("{}/{}", model.provider.0, model.id);
+            let log = |line: String| {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(file, "{} {line}", Utc::now().to_rfc3339());
+                }
             };
-            let Ok(true) = sessions.set_title_if_new(&session_id, &title).await else {
-                return;
+            log(format!("title: generating with {model_label}"));
+            let generated = tokio::time::timeout(
+                Duration::from_secs(30),
+                generate_chat_title(model, auth, &prompt),
+            )
+            .await;
+            let title = match generated {
+                Err(_) => {
+                    log(format!("title: timed out ({model_label})"));
+                    return;
+                }
+                Ok(Ok(Some(title))) => title,
+                Ok(Ok(None)) => {
+                    log(format!("title: no text ({model_label})"));
+                    return;
+                }
+                Ok(Err(error)) => {
+                    log(format!("title: failed ({model_label}): {error}"));
+                    return;
+                }
             };
+            log(format!("title: got {title:?}"));
+            match sessions.set_title_if_new(&session_id, &title).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    log(format!("title: save failed: {error}"));
+                    return;
+                }
+            }
             emit_response(
                 &tx,
                 ResponseEnvelope::session_event(
@@ -2070,13 +2124,16 @@ async fn generate_chat_title(
     };
     let mut options = pie_ai::SimpleStreamOptions::default();
     // Reasoning models spend output tokens on thinking and reject
-    // `temperature`; keep thinking minimal and leave room for the answer.
+    // `temperature`; keep thinking low (`minimal` is not accepted everywhere).
     options.base.max_tokens = Some(96);
-    options.reasoning = Some(pie_ai::ThinkingLevel::Minimal);
+    options.reasoning = Some(pie_ai::ThinkingLevel::Low);
     let stream_fn = stead_stream_fn(auth);
     let Some(message) = stream_fn(&model, &context, Some(&options)).result().await else {
         return Ok(None);
     };
+    if let Some(error) = message.error_message.as_deref() {
+        return Err(BrainError::AgentRun(format!("title model error: {error}")));
+    }
     Ok(clean_generated_title(&assistant_visible_text(
         &message.content,
     )))
@@ -2818,6 +2875,11 @@ struct SessionStore {
 impl SessionStore {
     fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// Directory that holds every session (the agent home's `sessions/`).
+    fn root_dir(&self) -> &Path {
+        &self.root
     }
 
     async fn create(&self, params: CreateSessionParams) -> Result<SessionInfo> {
