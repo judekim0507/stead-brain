@@ -1222,7 +1222,7 @@ impl BrainCore {
                 request_id.clone(),
                 session_info.id.clone(),
                 params.text.clone(),
-                model.clone(),
+                title_model_for(&model),
                 tx.clone(),
             );
         }
@@ -2023,6 +2023,32 @@ fn apply_stead_stream_defaults(model: &pie_ai::Model, options: &mut pie_ai::Simp
     }
 }
 
+/// The cheapest capable sibling of the turn's model, used for side jobs like
+/// chat titles so they never wait on (or pay for) the main model.
+fn title_model_for(turn_model: &pie_ai::Model) -> pie_ai::Model {
+    let provider = turn_model.provider.0.as_str();
+    let candidates: &[&str] = match provider {
+        "openai-codex" => &["gpt-5.6-luna", "gpt-5.5"],
+        "anthropic" => &["claude-haiku-4-5", "claude-3-5-haiku-latest"],
+        "openai" => &["gpt-5.6-luna", "gpt-5-mini", "gpt-4.1-mini"],
+        "google" => &["gemini-2.5-flash-lite", "gemini-2.5-flash"],
+        _ => &[],
+    };
+    for id in candidates {
+        if *id == turn_model.id {
+            return turn_model.clone();
+        }
+        let selection = stead_brain_protocol::ModelSelection {
+            provider: provider.to_string(),
+            model: (*id).to_string(),
+        };
+        if let Ok(model) = resolve_model(Some(&selection)) {
+            return model;
+        }
+    }
+    turn_model.clone()
+}
+
 async fn generate_chat_title(
     model: pie_ai::Model,
     auth: ProviderAuthStore,
@@ -2043,8 +2069,10 @@ async fn generate_chat_title(
         tools: None,
     };
     let mut options = pie_ai::SimpleStreamOptions::default();
-    options.base.max_tokens = Some(32);
-    options.base.temperature = Some(0.2);
+    // Reasoning models spend output tokens on thinking and reject
+    // `temperature`; keep thinking minimal and leave room for the answer.
+    options.base.max_tokens = Some(96);
+    options.thinking_level = ThinkingLevel::Minimal;
     let stream_fn = stead_stream_fn(auth);
     let Some(message) = stream_fn(&model, &context, Some(&options)).result().await else {
         return Ok(None);
